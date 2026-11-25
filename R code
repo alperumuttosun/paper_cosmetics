@@ -1,0 +1,1721 @@
+# ======================================================================
+# Analysis pipeline, steps 00-12 (cumulative; run top to bottom)
+#   step00 : download of the openFDA cosmetic adverse event data
+#   step01 : cleaning; reporting channel, reporting regime, product
+#            category, event group and litigation-type flag; descriptives
+#   step02 : signal detection methods (PRR, ROR, IC, EBGM, MH-ROR,
+#            subgroup ROR, proposed regime- and burst-robust method RB),
+#            application to the observed data, main Monte Carlo simulation
+#   step03 : figures (1200 dpi PNG + PDF) and tables
+#   step04 : robustness analyses - RB tuning constants, litigation spread
+#            over several categories, alternative litigation-type
+#            definitions in the observed data
+#   step05 : report-level bootstrap, one event group per report,
+#            overdispersed multi-event simulation, Hartung-Knapp pooling,
+#            Benjamini-Hochberg FDR, classification validation sample
+#   step06 : export of product-name strings and preferred terms with
+#            counts, used to revise the keyword rules
+#   step07 : keyword rules v3 and an independent validation sample
+#   step08 : final keyword rules v4 and the final validation sample
+#   step09 : probable duplicate reports (observed data); true signals in
+#            the shocked category (simulation); non-litigation monthly
+#            means over alternative reference periods
+#   step10 : Paule-Mandel pooling and a trailing (prospective) baseline
+#            window, simulation and observed data
+#   step11 : report-level 2x2 tables (observed data and simulation),
+#            serious-event enrichment in the mandatory regime, extreme
+#            dominance of one category
+#   step12 : true signal in the shocked pair itself; burst duration
+#            (6, 9, 12, 18 months)
+# Every step writes its outputs to the working folder and is skipped on
+# later runs when these outputs already exist; nothing is re-downloaded.
+# Before running, set the folder paths in `cand` (section 0) to a folder
+# on your own computer.
+# ======================================================================
+
+# ---- 0. Settings ------------------------------------------------------
+options(encoding = "UTF-8", timeout = 900, stringsAsFactors = FALSE)   # UTF-8 default, long timeout
+invisible(suppressWarnings(try(Sys.setlocale("LC_CTYPE", "Turkish_Turkey.utf8"), silent = TRUE)))  # UTF-8 locale if available
+
+pkgs <- c("jsonlite", "httr", "data.table", "readxl")                  # packages used
+for (p in pkgs) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)  # install only if missing
+suppressPackageStartupMessages({
+  library(jsonlite); library(httr); library(data.table); library(readxl)
+})
+
+cand <- c("C:/Users/Alper.Tosun/Desktop/cru130",                       # main machine
+          "C:/Users/autos/OneDrive/Desktop/cru130")                    # second machine
+root <- cand[dir.exists(cand)][1]                                      # first existing folder
+if (is.na(root)) stop("cru130 folder not found on this machine")
+wd <- file.path(root, "paper_cosmetics")                               # project folder
+if (!dir.exists(wd)) dir.create(wd)
+setwd(wd)
+cat("Working folder:", wd, "\n")
+
+# ---- 1. Helper functions ---------------------------------------------
+clean_utf8 <- function(x) {                                            # force valid UTF-8 text
+  x <- as.character(x)
+  x <- iconv(x, from = "UTF-8", to = "UTF-8", sub = "")                # drop invalid bytes
+  x[is.na(x)] <- ""
+  enc2utf8(x)
+}
+
+get_json <- function(url, tries = 3) {                                 # safe GET for openFDA
+  for (i in seq_len(tries)) {
+    r <- tryCatch(httr::GET(url, httr::timeout(90)), error = function(e) NULL)
+    if (!is.null(r)) {
+      sc <- httr::status_code(r)
+      if (sc == 200) {
+        txt <- httr::content(r, as = "text", encoding = "UTF-8")
+        txt <- iconv(txt, "UTF-8", "UTF-8", sub = "")
+        return(jsonlite::fromJSON(txt, simplifyVector = TRUE))
+      }
+      if (sc == 404) return(NULL)                                      # "no match" in openFDA
+    }
+    Sys.sleep(2 * i)
+  }
+  NULL
+}
+
+g1 <- function(x, nm) {                                                # one field, arrays joined by "|"
+  v <- x[[nm]]
+  if (is.null(v) || length(v) == 0) return(NA_character_)
+  clean_utf8(paste(unlist(v), collapse = "|"))
+}
+
+base_api <- "https://api.fda.gov/cosmetic/event.json"                  # openFDA cosmetic endpoint
+
+# ======================================================================
+# STEP 00 : data download and availability check (skipped when done)
+# ======================================================================
+step00_files <- c("step00_openfda_reports.csv", "step00_openfda_meta.csv",
+                  "step00_api_yearly.csv", "step00_api_monthly.csv")
+if (all(file.exists(step00_files))) {
+  cat("step00 outputs found -> step00 skipped\n")
+} else {
+  status <- list(yolA = FALSE, yolB = FALSE)
+
+  # ---- OPTION A : bulk download -----------------------------------------
+  f_rep <- "step00_openfda_reports.csv"
+  status$yolA <- tryCatch({
+    if (!file.exists(f_rep)) {
+      dl <- get_json("https://api.fda.gov/download.json")              # list of bulk files
+      if (is.null(dl)) stop("download.json not reachable")
+      parts <- dl$results$cosmetic$event$partitions; src <- "cosmetic/event"
+      if (is.null(parts) || NROW(parts) == 0) { parts <- dl$results$food$event$partitions; src <- "food/event" }
+      if (is.null(parts) || NROW(parts) == 0) stop("no bulk partitions found")
+      zips <- character(0)
+      for (u in parts$file) {                                          # download each zip once
+        zf <- basename(u)
+        if (!file.exists(zf)) download.file(u, zf, mode = "wb", quiet = TRUE)
+        zips <- c(zips, zf)
+      }
+      read_part <- function(zf) {                                      # read one zipped JSON
+        inside <- unzip(zf, list = TRUE)$Name[1]
+        con <- unz(zf, inside); on.exit(close(con))
+        txt <- paste(readLines(con, encoding = "UTF-8", warn = FALSE), collapse = "\n")
+        txt <- iconv(txt, "UTF-8", "UTF-8", sub = "")
+        jsonlite::fromJSON(txt, simplifyVector = FALSE)$results
+      }
+      recs <- unlist(lapply(zips, read_part), recursive = FALSE)
+      samp <- recs[unique(round(seq(1, length(recs), length.out = min(5000, length(recs)))))]
+      fl   <- unlist(lapply(samp, function(r) unique(gsub("[0-9]+$", "", names(unlist(r))))))
+      inv  <- data.table(field = names(table(fl)), n_in_sample = as.integer(table(fl)))
+      inv[, share := round(n_in_sample / length(samp), 3)]
+      fwrite(inv[order(-share)], "step00_field_inventory.csv", bom = TRUE)
+      flat <- rbindlist(lapply(recs, function(r) {
+        pr <- if (!is.null(r$products)) r$products else r$product
+        pn <- if (length(pr)) vapply(pr, function(p) g1(p, "product_name"), "") else NA_character_
+        ro <- if (length(pr)) vapply(pr, function(p) g1(p, "role"), "") else NA_character_
+        ind <- if (length(pr)) vapply(pr, function(p) g1(p, "industry_name"), "") else NA_character_
+        pa <- r$patient; if (is.null(pa)) pa <- r$consumer
+        data.table(
+          report_number = g1(r, "report_number"), report_version = g1(r, "report_version"),
+          legacy_report_id = g1(r, "legacy_report_id"), report_type = g1(r, "report_type"),
+          initial_received_date = g1(r, "initial_received_date"),
+          latest_received_date = g1(r, "latest_received_date"), event_date = g1(r, "event_date"),
+          n_products = length(pr),
+          product_names = clean_utf8(paste(pn, collapse = "|")),
+          product_roles = clean_utf8(paste(ro, collapse = "|")),
+          industry = clean_utf8(paste(unique(ind), collapse = "|")),
+          reactions = g1(r, "reactions"), outcomes = g1(r, "outcomes"),
+          age = if (is.null(pa)) NA_character_ else g1(pa, "age"),
+          age_unit = if (is.null(pa)) NA_character_ else g1(pa, "age_unit"),
+          gender = if (is.null(pa)) NA_character_ else g1(pa, "gender"))
+      }), fill = TRUE)
+      if (src == "food/event") flat <- flat[grepl("cosmetic", industry, ignore.case = TRUE)]
+      flat[, source_endpoint := src]
+      fwrite(flat, f_rep, bom = TRUE)
+    }
+    TRUE
+  }, error = function(e) { cat("step00 Option A failed:", conditionMessage(e), "\n"); FALSE })
+
+  # ---- OPTION B : API count queries --------------------------------------
+  status$yolB <- tryCatch({
+    if (!file.exists("step00_openfda_meta.csv")) {
+      a <- get_json(paste0(base_api, "?sort=initial_received_date:asc&limit=1"))
+      z <- get_json(paste0(base_api, "?sort=initial_received_date:desc&limit=1"))
+      if (is.null(z)) stop("cosmetic/event API not reachable")
+      fwrite(data.table(last_updated = z$meta$last_updated, total_reports = z$meta$results$total,
+                        first_received = a$results$initial_received_date[1],
+                        last_received = z$results$initial_received_date[1],
+                        fields_in_latest_record = paste(unique(names(unlist(z$results))), collapse = "; ")),
+             "step00_openfda_meta.csv", bom = TRUE)
+    }
+    if (!file.exists("step00_api_yearly.csv") || !file.exists("step00_api_monthly.csv")) {
+      yrs <- 2001:as.integer(format(Sys.Date(), "%Y")); yr_rows <- list(); mo_rows <- list()
+      for (y in yrs) {
+        rng <- sprintf("initial_received_date:[%d0101+TO+%d1231]", y, y)
+        tot <- get_json(sprintf("%s?search=%s&limit=1", base_api, rng))
+        n_y <- if (is.null(tot)) 0L else as.integer(tot$meta$results$total)
+        rt  <- get_json(sprintf("%s?search=%s&count=report_type.exact", base_api, rng))
+        if (is.null(rt)) rt <- get_json(sprintf("%s?search=%s&count=report_type", base_api, rng))
+        yr_rows[[length(yr_rows) + 1]] <- if (!is.null(rt) && length(rt$results))
+          data.table(year = y, total = n_y, report_type = clean_utf8(rt$results$term), n = rt$results$count) else
+          data.table(year = y, total = n_y, report_type = NA_character_, n = NA_integer_)
+        if (n_y > 0) {
+          dd <- get_json(sprintf("%s?search=%s&count=initial_received_date", base_api, rng))
+          if (!is.null(dd) && length(dd$results))
+            mo_rows[[length(mo_rows) + 1]] <- data.table(day = as.character(dd$results$time), n = dd$results$count)
+        }
+        Sys.sleep(0.4)
+      }
+      fwrite(rbindlist(yr_rows, fill = TRUE), "step00_api_yearly.csv", bom = TRUE)
+      mo <- rbindlist(mo_rows)
+      if (nrow(mo)) mo <- mo[, .(n = sum(n)), by = .(month = substr(day, 1, 6))][order(month)]
+      fwrite(mo, "step00_api_monthly.csv", bom = TRUE)
+    }
+    TRUE
+  }, error = function(e) { cat("step00 Option B failed:", conditionMessage(e), "\n"); FALSE })
+  print(unlist(status))
+}
+
+
+# ======================================================================
+# STEP 01 : cleaning, categories (rules v2), event groups, descriptives
+# Re-runs only once after a rule change (marker file step01_rules_v2.txt)
+# ======================================================================
+cat("\n--- step01 ---\n")
+mocra_date <- as.Date("2023-12-29")                                    # mandatory reporting start
+
+# ---- 01.0 rule sets (shared with step02) ------------------------------
+cat_rules <- list(                                                     # product category, rules v4, first match wins (labels may repeat)
+  tattoo            = "tattoo|\\bink\\b|inkbox|pigment|grey wash|microblading|permanent cosmetic|\\bpmu\\b|jagua",
+  hair_dye          = "\\bdye|hair colou?r|henna|\\bhena\\b|bleach|bigen|clairol|natural instincts|just for men|just 4 men|root touch|root (cover|rescue)|colou?r ?silk|colorsilk|superior preference|preference mousse|mousse absolue|reus(e)?able colou?r|\\bpreference\\b|excellence|feria|\\bolia\\b|nutrisse|nurtrisse|socolor|majirel|\\binoa\\b|koleston|colou?r charm|colou?r ultime|colou?rista|cr[e]?me gloss|cream gloss|casting cr(e|ea)me?|gray solution|schwarzkopf (professional quality |keratin |simply )?colou?r|simply colou?r|got ?2 ?b metallics|metallic blue|pravana (chromosilk|vivids)|vivids|madison reed|naturtint|grecian|mustache (&|and )?colou?r|beard colou?r|colou?r sensation|go intense|fade resist|dark (&|and) lovely \\d|lightener|developer|cr[e]?me peroxide|\\bdemi\\b|permanent (cr[e]?me )?colou?r|keracolor|\\bsplat\\b|blondissimes|go blonder|colou?r expert|anti grey|grayban|elumen|framcolor|kemon|jeans colou?r|iconic permanent|organic colou?r system|teinture|asp colou?r|pulp riot|ion colou?r|all nutrient|magic root|one-twist|hicolor|nice ?(&|'?n'?) ?easy|colou?r fire|medium auburn|rich merlot|brilliant red|shades eq|hcolor",
+  powder_talc       = "talc|powder|shower to shower",
+  hair_removal      = "nair|depilat|depilya|hair remov|\\bwax|razor|shav|\\bveet\\b|pre electric",
+  hair_straightener = "^(?!.*bum bum).*(relax|rhelaxer|relayer|colorlaxer|straighten|\\btcb\\b|\\bkeratin|braz[il]+ian|\\bperm\\b|texture softener|smoothing (kit|system|solution)|opti.?smooth|kleravitex|easystraight|magic sleek|wave nouveau)",
+  skin_care         = "eye contour|contouring eye|eye cr(e|ea)me?|body butter|massage butter|make.?up remover|make remover|remover (wipe|cloth|towel)|micellar|cleansing water|effasol|^(?!.*(shampoo|conditioner|devacurl|\\bpoo\\b)).*(body ?wash|shower (gel|cr[e]?me)|shower (&|and) bath|no rinse)",
+  other             = "feminine|douche|vaginal|norforms|summer.?s eve|massengill|\\byoni\\b|kotex|panty ?liner|honey ?pot|replens|suppositor|\\blube\\b|womb|monistat|\\bvcf\\b|\\blice\\b",
+  deodorant         = "deod|deoder|deodr|deord|antiperspirant|\\bdeo\\b|aluminum free|pit paste",
+  hair_care         = "^(?!.*(mascara|(?<!sp)(?<!f)lash|brow(?!n)|airbrush|dream (liquid|matte)|bond no|suave (cocoa shea )?lotion|suave lotion|suaveskin|\\bfacial\\b|face wash|\\blip|deod|body (spray|wash|lotion)|foundation|make.?up|tanning|self.?tan)).*(shampoo|conditioner|hair|scalp|\\bwen\\b|monat|devacurl|deva curl|ogx|pureology|redken|biolage|styl|curl|olaplex|olapex|oleplex|kerastase|keratase|kerstase|bond (building|smoother|repair|maintenance)|no\\. ?\\d|shambase|shamcond|tres+e?m+e+|pantene|aussie|herbal essences|fructis|fructice|elvive|bed ?head|bedhead|tigi|catwalk|nexxus|suave|alberto|v05|head (and|&) shoulders|infusium|it'?s a 10|moroccanoil|ouidad|instacure|\\bmatrix\\b|keranique|nioxi?n|follicle|follicare|crece pelo|detangl|no more tangles|leave.?in|mousse|pomade|edge ?(control|wax)|edgewax|root lifter|volumizing (mousse|spray|gel)|volumizer|sea salt spray|sheen spray|\\bloc\\b|braid|\\bwig|lace (glue|wigs)|lace and lace|ghost ?bond|bond (glue|classic)|got ?2 ?b|spray.?n.?lock|toppik|anti.?breakage|milk shake|shu uemura|oribe|\\balterna\\b|innersense|\\bcantu\\b|mielle|olive miracle|softee|stress fix|kera fruit|keralis|coppola|defabulous|chaz dean|colou?r wow|blowout|blow out cream|brass off|blow dry|mizani|\\brusk\\b|glazing|\\bgro\\b|beard|sistaco|vitapointe|wonder water|crop preserver|neatbraid|build up blocker|whole blends|creme of nature|yucca plantain)",
+  nail              = "nail|polish|manicure|acrylic|\\bmma\\b|gel lacquer|soak.?off|base coat|top ?coat|monomer|pedicure|kwik off|acetone|\\bopi\\b|gel bottle|born pretty|mundo de unas|mavala|ridge filling|bonder|versagel|brush on gel|miracle gel|beetles",
+  oral_care         = "tooth|teeth|\\btp\\b|mouth ?wash|mouth ?rinse|oral (rinse|care|health)|dental|dentifrice|dentlfrice|floss|listerine|l\\.isterine|breath|binaca|whitening (strip|gel|kit|pen|tray|system|paste)|whitestrip|white ?strips|white kit|white trays|optic white|antiplaque|plaque|fluoride|gleem|arc whitening|crest|colgate(?!.*soap)|opalescence|rembrandt|brite ?smile|hismile|\\bsmile\\b|\\bplax\\b|\\bscope|periobrite|periosciences|dry mouth|fixodent|earthpaste|aquafresh|pulling oil|biotene",
+  fragrance         = "^(?!.*(spf|\\bsun\\b|deod|deoder)).*(body spray|body mist|fragrance mist)",
+  deodorant         = "^(?!.*(secret society|shambase|shamcond)).*(old spice|oldspice|^secret$|^secret\\||\\|secret\\||\\|secret$|secret (dry|spray|aluminum|outlast|clinical|invisible|deod|antiperspirant)|spray secret|speed stick|\\bdegree\\b|mennen|\\baxe\\b|\\blume\\b|\\bbrut\\b|odor.?eater|stink|\\bmss deo)",
+  eye_makeup        = "^(?!.*(contour|highlight)).*(mascara|eye ?liner|(?<!lip )liner|eye ?shadow|shadows?\\b|(?<!sp)(?<!f)lash|brow(?!n)|kohl|surma|eye (pencil|colou?r|art|stain)|\\bi[- ]?colou?r|palette|morphe|eyelast|paint pot|falsies|scandaleyes|volume revolution|telescopic|voluminous|colossal|eye precision|that'?s the point|gel pencil|precision pencil)",
+  makeup_lip        = "contour|highlight|foundation|conceal|bb cr[e]?me|bb cream|tinted|setting (spray|mist)|finishing veil|sheer cover|bare ?minerals|true match|\\blumi\\b|infallible|\\bteint|fenty|primer|prime \\+|blush|bronzer|lipstick|\\blip|gloss|lip.?plump|plumper|plumpify|lifter plump|plump potion|plump jelly|plumping gloss|pucker|velvetine|velveteen|duck pump|pout|plumped|velv?entine|prep \\+ prime|prime fix|maybel+ine|\\belf\\b|e\\.l\\.f|chap ?stick|blistex|\\beos\\b|make.?up|design.?a.?face|face stick|cosmetic sponge|blending sponge|mineral cosmetics|coverblend|cover ?girl|matchco|zuri natural|flori roberts|jane iredale|kollections|age rewind|colorstay|glitter|shimmer|provocalips|thotgloss|moodstruck|maybelline|\\bnyx\\b",
+  hair_dye          = "clariol|gray away|(golden|medium|light|ash|neutral|reddish) brown",
+  sun_tan           = "sunscreen|\\bspf|sun ?block|sunless|tanning|self.?tan|bronz|\\btan\\b|tanologist|\\bsun\\b|after.?sun",
+  fragrance         = "^(?!.*(cream|serum|lotion|capture|night|balm)).*(perfume|fragrance|cologne|parfum|eau de|\\bedp\\b|\\bedt\\b|musk|eternity|chanel|\\bdior\\b|bulgari|bvlgari|armani|acqua di|boucheron|bond no|white linen|dream angels|love spell|la vie est belle|thierry mugler|mugler|angel perfume|calvin klein|matchabelli|florida water|royal violets|patrick dempsey|wild country|\\bidole\\b|clinique happy|vanilla latte|havana spirit|silk and noir|sweet pea|\\bsplash\\b)",
+  other             = "sanitizer|hygienic hand gel|nasal|saline|sinus|zicam|contact lens|theratears|ocusoft|occusoft|methyl.?iso|isothiazo|kathon|propylene glycol|insulin|tylenol|linzess|benlysta|melatonin|laxative|\\bhcg\\b|weight loss|essential oils?|tea tree oil|doterra(?!.*(cream|lotion))|young living(?!.*(cream|lotion))|aura cacia|tissue|muscle rub",
+  baby_other        = "baby|bebe|diaper|infant|teething|jbaby|mustela|huggies",
+  skin_care         = "cream|cr[e]?me|crme|lotion|moistur|serum|cleanser|face|facial|skin|soap|wash|wipe|scrub|mask|masque|toner|toning|balm|\\boil\\b|acne|retin|peel|body|neutrogena|\\bntg\\b|aveeno|cetaphil|jergens?|gold bond|pond|nerium|lubriderm|cerave|olay|dove|irish spring|eucerine?|eurcerin|curel|nivea|vaseline|petroleum jelly|aloe|shea|cocoa butter|butter|bath|bubble|shower|epsom|\\bsalts?\\b|clay|bentonite|benzonite|kaolin|essence|eye (gel|cr[e]?me|crme|contour|concentrate|kit|treatment|zone|emulsion|system|lift|pads|area|defy)|under ?eye|eye gelee|eyes\\b|dark (circle|spot)|puffy eyes|bags be gone|wrinkle|aging|age (perfect|reverse|renewal|defy)|anti.?age|revita ?lift|revatalift|regenerist|genifique|renergie|night repair|time zone|resilience|repairwear|prevage|pevage|strivectin|stryvectin|\\banew\\b|\\broc\\b|correxion|obagi|nu.?derm|proactiv|clinique|clinque|lancome|estee lauder|kiehl|la mer|avene|avenne|la roche|vichy|caudalie|dermalogica|eltamd|murad|perricone|sunday riley|the ordinary|drunk elephant|ole hen|meaningful beauty|principal secret|natural advantage|reclaim|hope in a jar|crepe|firm|lift|towelette|cloth|pads|exfoli|microderm|abrasion|pore|blemish|salicylic|glycolic|lactic|amlactin|urea|hyalur|niacinamide|vitamin c|vit-c|ferulic|collagen|peptide|whitening|fair (and|&) (white|lovely)|caro white|lighten|brightening|thanakha|melasma|hand (cream|cr[e]?me|treatment|relief)|\\bfoot\\b|heel|callus|cracked|sanitas|\\bbar\\b|bars\\b|ivory|caress|\\bdial\\b|\\bzest\\b|purpose|noxzema|noxema|biore|clean (and|&) clear|st\\. ives|massage|salve|ointment|\\bgel\\b|glow|bath bomb|bathbom|bath fizzer|cosmelan|exosome|stem cell|mesotherapy|syringe|botox|stemtox|repair|healing|youth|radiance|spot|patch|scar|kerasal|towels|cottonelle|cleansing|squalane|alpha hydroxy|\\baha\\b"
+)
+assign_cat <- function(x) {                                            # vectorised first-match category
+  x <- tolower(clean_utf8(x))
+  x <- gsub("fragrance[- ]free", "", x)                                # "fragrance free" is not a fragrance
+  out <- rep("other", length(x)); done <- rep(FALSE, length(x))
+  for (i in seq_along(cat_rules)) {                                    # rules in order; a label can appear twice
+    hit <- !done & grepl(cat_rules[[i]], x, perl = TRUE)
+    out[hit] <- names(cat_rules)[i]; done <- done | hit
+  }
+  out
+}
+
+ev_rules <- list(                                                     # MedDRA PT -> event group, rules v4, first match wins
+  cancer           = "^(?!.*(benign|precancer|fibroadenoma|leukocyt|leukonych|cancer index)).*(cancer|neoplasm|mesothelioma|carcinoma|lymphoma|leukaemia|leukemia|sarcoma|tumou?r|malignan|metasta|melanoma|myeloma|hodgkin)",
+  death            = "^death$",
+  hair_loss        = "alopecia|hair loss|trichorrhexis|hair texture|hair disorder|hypotrichosis|madarosis|hair growth|hair injury|hair colour|hair breakage",
+  eye              = "\\beye|ocular|conjunctiv|vision|visual|lacrimation|blind|eyelid|eyelash|corneal|cornea|hordeolum|blephar|keratitis|keratopathy|uveitis|iritis|scleritis|chalazion|photophobia|meibom|vitreous|retina|cataract|glaucoma|diplopia|mydriasis|photopsia|dacryo|pterygium|pinguecula|asthenopia|maculopathy|macular degeneration|optic neuritis|intraocular",
+  respiratory      = "^(?!.*(swelling|tightness|allerg|pharyngeal oedema|nasal oedema|laryngeal oedema|respiratory tract oedema|blister|cancer|neoplasm|mesothelioma|carcinoma|embol|thrombosis|arterial hypertension|pulmonary hypertension|valve)).*(dyspnoea|cough|wheez|asthma|respirat|throat|sneez|rhinorr|nasal|pharyn|bronch|pneumon|lung|pulmonary|pleura|atelectasis|emphysema|asbestosis|silicosis|pneumoconiosis|sinusitis|sinus (congestion|disorder|pain)|rhinitis|laryng|hypoxia|apnoea|hypopnoea|airway|epistaxis|dysphonia|aphonia|tachypnoea|hypoventilation|hyperventilation|oxygen saturation|choking|asphyxia|obstructive airways|chronic obstructive|interstitial lung|haemoptysis|empyema|haemothorax|pneumothorax|aspiration)",
+  skin_irritation  = "^(?!.*(lupus|tooth|tongue|oral mucosal|nail|gastrointestinal|bladder|seborrhoeic keratosis)).*(burning sensation|rash|erythema|prurit|irritation|dermatitis|exfoliation|dry skin|eczema|skin reaction|skin disorder|acne|discolou|pain of skin|cheilitis|chapped|lip dry|skin tight|sensitive skin|skin fissure|seborr|psoriasis|dandruff|application site (pain|erythema|rash|prurit|irritation|dryness|reaction|exfoliation|discolou|urticaria))",
+  burn_wound       = "^(?!.*(gastric|colitis|gastrointestinal|duodenal|feet syndrome|keratitis|scabies|gun shot)).*(burn|blister|vesicle|scar\\b|scab\\b|wound|skin ulcer|^ulcer$|application site ulcer|mouth ulcer|aphthous|genital ulcer|perineal ulcer|scrotal ulcer|laceration|abrasion)",
+  allergy_swelling = "^(?!.*(pulmonary|brain|cerebral|papill|lymph|gallbladder|gastrointestinal|joint|test negative|breast|testicular|penile|scrotal)).*(swelling|oedema|hypersensitiv|anaphyla|angioedema|throat tight|allerg|urticaria|swollen)",
+  infection        = "infection|infected|cellulitis|abscess|furuncle|carbuncle|folliculitis|pustul|purulen|^cyst$|dermal cyst|application site cyst|epidermal cyst|\\bcystitis\\b|tinea|mycosis|candid|impetigo|herpes|sepsis|septic|bacteraemia|vaginosis|vulvovaginitis|meningitis|tuberculosis|influenza|covid|myiasis|listeriosis|botulism|endocarditis|scabies|infestation|mononucleosis|coccidioid|aspergill|toxic shock|omphalitis|pyelonephritis|bartholinitis|molluscum|wart",
+  systemic         = "headache|dizziness|nausea|vomit|paraesthesia|seizure|syncope|fatigue|malaise|pyrexia|chills|consciousness|migraine|diarrh|tremor|asthenia|hypoaesthesia|insomnia|lethargy|somnolence|retching|vertigo|presyncope",
+  injury_exposure  = "^(?!.*(kidney|liver|renal|spinal|brain|lung|colon|ovarian|radiation|optic|retinal|vitreous|iris|nerve|vascular|head injury|limb|ankle|tooth)).*(injury|exposure|emotional|anxiety|distress|occupational|depression|stress)"
+)
+assign_ev <- function(pt) {                                            # vectorised first-match event group
+  x <- tolower(clean_utf8(pt)); out <- rep("other", length(x)); done <- rep(FALSE, length(x))
+  for (i in seq_along(ev_rules)) {                                     # rules in order
+    hit <- !done & grepl(ev_rules[[i]], x, perl = TRUE)
+    out[hit] <- names(ev_rules)[i]; done <- done | hit
+  }
+  out
+}
+
+if (file.exists("step01_rules_v4.txt") && file.exists("step01_reports_clean.csv")) {
+  cat("step01 (rules v4) outputs found -> step01 skipped\n")
+} else {
+  # ---- 01.1 read report-level file (two ways) --------------------------
+  dat <- tryCatch(fread("step00_openfda_reports.csv", encoding = "UTF-8", colClasses = "character"),
+                  error = function(e) NULL)                            # Option A
+  if (is.null(dat)) dat <- as.data.table(read.csv("step00_openfda_reports.csv", fileEncoding = "UTF-8-BOM",
+                                                  colClasses = "character", check.names = FALSE))  # Option B
+  chr <- names(dat)[vapply(dat, is.character, TRUE)]
+  dat[, (chr) := lapply(.SD, clean_utf8), .SDcols = chr]               # clean all text
+  cat("Reports read:", nrow(dat), "\n")
+
+  # ---- 01.2 suspect products only --------------------------------------
+  susp_only <- function(nm, ro) {
+    n <- strsplit(nm, "|", fixed = TRUE)[[1]]; r <- strsplit(ro, "|", fixed = TRUE)[[1]]
+    if (length(r) != length(n)) return(nm)
+    k <- n[tolower(r) == "suspect"]
+    if (length(k) == 0) nm else paste(k, collapse = "|")
+  }
+  dat[, suspect_products := mapply(susp_only, product_names, product_roles, USE.NAMES = FALSE)]
+
+  # ---- 01.3 categories, event groups, channel, regime -------------------
+  dat[, category := assign_cat(suspect_products)]
+  pt_long <- dat[, .(pt = unlist(strsplit(reactions, "|", fixed = TRUE))), by = report_number]  # one row per PT
+  pt_long[, ev := assign_ev(pt)]
+  evg <- pt_long[, .(event_groups = paste(sort(unique(ev)), collapse = "|")), by = report_number]
+  dat <- merge(dat, evg, by = "report_number", all.x = TRUE)
+  dat[is.na(event_groups) | event_groups == "", event_groups := "other"]
+  fwrite(unique(pt_long[, .(pt, ev)])[order(ev, pt)], "step01_pt_eventgroup_map.csv", bom = TRUE)  # PT map for checking
+
+  dat[, recv := as.IDate(initial_received_date, format = "%Y%m%d")]
+  dat[, ym := format(recv, "%Y-%m")]
+  dat[, year := as.integer(substr(initial_received_date, 1, 4))]
+  dat[, channel := fifelse(report_type == "Direct", "Direct", "Industry")]
+  dat[, regime := fifelse(recv >= mocra_date, "post", "pre")]
+  dat[, cancer_rx := grepl("cancer", event_groups)]
+  dat[, litig_flag := category == "powder_talc" | cancer_rx]           # litigation-type marker
+  dat[, death := grepl("death", outcomes, ignore.case = TRUE)]
+  dat[, serious := grepl("death|hospital|life threat|disab|congenital|other serious|intervention", outcomes, ignore.case = TRUE)]
+  dat[, n_reactions := lengths(strsplit(reactions, "|", fixed = TRUE))]
+
+  keep <- c("report_number", "report_type", "channel", "regime", "recv", "ym", "year",
+            "suspect_products", "category", "reactions", "event_groups", "n_reactions", "outcomes",
+            "serious", "death", "cancer_rx", "litig_flag", "age", "age_unit", "gender")
+  fwrite(dat[, ..keep], "step01_reports_clean.csv", bom = TRUE)
+  # ---- 01.4 descriptive tables (Option A data.table, Option B base R) ---------
+  desc_A <- function() {
+    fwrite(dat[, .N, by = .(suspect_products = toupper(suspect_products), category)][order(-N)][1:min(.N, 400)],
+           "step01_category_check.csv", bom = TRUE)
+    fwrite(dat[, .N, by = .(ym, channel, litig_flag)][order(ym, channel, litig_flag)], "step01_monthly_counts.csv", bom = TRUE)
+    fwrite(dat[litig_flag == FALSE, .N, by = .(year, channel, category)][order(year, channel, -N)], "step01_category_year.csv", bom = TRUE)
+    fwrite(dat[, .(n = .N, n_litig = sum(litig_flag), n_serious = sum(serious), n_death = sum(death),
+                   mean_pt = round(mean(n_reactions), 2)), by = .(year, channel)][order(year, channel)],
+           "step01_year_channel_summary.csv", bom = TRUE)
+    TRUE
+  }
+  desc_B <- function() {
+    df <- as.data.frame(dat); df$one <- 1
+    ck <- aggregate(one ~ suspect_products + category, data = df, FUN = sum)
+    write.csv(head(ck[order(-ck$one), ], 400), "step01_category_check.csv", row.names = FALSE, fileEncoding = "UTF-8")
+    write.csv(aggregate(one ~ ym + channel + litig_flag, data = df, FUN = sum), "step01_monthly_counts.csv", row.names = FALSE, fileEncoding = "UTF-8")
+    write.csv(aggregate(one ~ year + channel + category, data = df[!df$litig_flag, ], FUN = sum), "step01_category_year.csv", row.names = FALSE, fileEncoding = "UTF-8")
+    write.csv(aggregate(cbind(one, litig_flag, serious, death) ~ year + channel, data = df, FUN = sum), "step01_year_channel_summary.csv", row.names = FALSE, fileEncoding = "UTF-8")
+    TRUE
+  }
+  ok <- tryCatch(desc_A(), error = function(e) { cat("step01 Option A failed:", conditionMessage(e), "\n"); FALSE })
+  if (!ok) ok <- tryCatch(desc_B(), error = function(e) { cat("step01 Option B failed:", conditionMessage(e), "\n"); FALSE })
+  writeLines("rules v4", "step01_rules_v4.txt")                        # marker: step01 done with v4 rules
+  rm(dat, pt_long, evg); invisible(gc())
+}
+
+# ======================================================================
+# STEP 02 : signal detection methods, real-data application, Monte Carlo
+# ======================================================================
+cat("\n--- step02 ---\n")
+
+# ---- 02.1 basic 2x2 statistics from a category x event matrix ---------
+tab2 <- function(M, rt = NULL) {                                       # all 2x2 cells; rt = reports per category (report level, step11)
+  a  <- M; ne <- colSums(M)
+  if (is.null(rt)) { nc <- rowSums(M); N <- sum(M) } else { nc <- rt; N <- sum(rt) }   # mention level (main) or report level
+  b  <- pmax(matrix(nc, nrow(M), ncol(M)) - a, 0)
+  cc <- matrix(ne, nrow(M), ncol(M), byrow = TRUE) - a
+  d  <- N - a - b - cc
+  list(a = a, b = b, c = cc, d = d, N = N, nc = nc, ne = ne)
+}
+ror_stats <- function(a, b, cc, d) {                                   # ROR with 0.5 correction, log scale
+  lr <- log((a + .5) * (d + .5) / ((b + .5) * (cc + .5)))
+  se <- sqrt(1 / (a + .5) + 1 / (b + .5) + 1 / (cc + .5) + 1 / (d + .5))
+  list(lor = lr, se = se, low = lr - 1.96 * se)
+}
+crude_methods <- function(M, rt = NULL) {                              # PRR, ROR, IC on pooled matrix
+  t2 <- tab2(M, rt); a <- t2$a; b <- t2$b; cc <- t2$c; d <- t2$d; N <- t2$N
+  prr  <- (a / pmax(a + b, 1e-9)) / pmax(cc / pmax(cc + d, 1e-9), 1e-9)
+  chi2 <- N * pmax(abs(a * d - b * cc) - N / 2, 0)^2 / pmax((a + b) * (cc + d) * (a + cc) * (b + d), 1e-9)  # Yates
+  r    <- ror_stats(a, b, cc, d)
+  E    <- outer(t2$nc, t2$ne) / N
+  ic   <- log2((a + .5) / (E + .5))
+  ic025 <- ic - 3.3 * (a + .5)^(-0.5) - 2 * (a + .5)^(-1.5)
+  list(a = a, E = E, prr = prr, chi2 = chi2, ror_low = r$low, lor = r$lor, ic025 = ic025,
+       f_prr = (prr >= 2 & chi2 >= 4 & a >= 3),
+       f_ror = (r$low > 0 & a >= 3),
+       f_ic  = (ic025 > 0 & a >= 3))
+}
+mh_method <- function(Ms, rts = NULL) {                                # Mantel-Haenszel ROR over strata (RGB variance)
+  R <- S <- PR <- PSQR <- QS <- 0; A <- 0
+  for (i in seq_along(Ms)) {
+    M <- Ms[[i]]
+    t2 <- tab2(M, if (is.null(rts)) NULL else rts[[i]]); a <- t2$a; b <- t2$b; cc <- t2$c; d <- t2$d; N <- t2$N
+    if (N <= 0) next
+    r <- a * d / N; s <- b * cc / N; P <- (a + d) / N; Q <- (b + cc) / N
+    R <- R + r; S <- S + s; PR <- PR + P * r; PSQR <- PSQR + (P * s + Q * r); QS <- QS + Q * s; A <- A + a
+  }
+  lor <- log(R / S)
+  v <- PR / (2 * R^2) + PSQR / (2 * R * S) + QS / (2 * S^2)
+  low <- lor - 1.96 * sqrt(v)
+  low[!is.finite(low)] <- NA
+  list(low = low, f = !is.na(low) & low > 0 & A >= 3)
+}
+
+# ---- 02.2 proposed method: burst weighting + background trimming + RE pooling
+burst_weights <- function(cm, z = 3, win = 13, align = "center") {    # cm: cat, k, r, t, y (monthly totals, full grid)
+  setorder(cm, k, r, cat, t)
+  trail_med <- function(y, k) {                                         # median of up to k previous months (no future data)
+    out <- numeric(length(y)); out[1] <- y[1]                           # first month: no history -> never a burst
+    for (i in seq_along(y)[-1]) out[i] <- median(y[max(1, i - k):(i - 1)])
+    out
+  }
+  if (align == "center") {
+    cm[, base := {
+      if (.N >= win) as.numeric(runmed(y, win, endrule = "median")) else rep(median(y), .N)
+    }, by = .(k, r, cat)]                                               # robust centred baseline within regime (main)
+  } else {
+    cm[, base := trail_med(y, win - 1), by = .(k, r, cat)]              # trailing baseline: previous 12 months (step10)
+  }
+  cm[, upper := base + z * sqrt(base) + 3]                              # Poisson-type upper bound
+  cm[, w := fifelse(y > upper, upper / y, 1)]                           # down-weight only excess months
+  cm
+}
+re_pool <- function(Y, V, method = "DL") {                            # DerSimonian-Laird across columns (strata); "HK" = Hartung-Knapp
+  W <- 1 / V; W[!is.finite(W)] <- 0
+  sw <- rowSums(W); m <- rowSums(W > 0)
+  ybar <- rowSums(W * Y, na.rm = TRUE) / sw
+  Q <- rowSums(W * (Y - ybar)^2, na.rm = TRUE)
+  C <- sw - rowSums(W^2) / sw
+  tau2 <- pmax(0, (Q - (m - 1)) / C); tau2[m <= 1 | !is.finite(tau2)] <- 0
+  if (method == "PM") {                                                # Paule-Mandel: solve generalised Q(tau2) = m - 1
+    tau_pm <- vapply(seq_len(nrow(Y)), function(i) {
+      ok <- W[i, ] > 0; k <- sum(ok); if (k <= 1) return(0)
+      y <- Y[i, ok]; v <- V[i, ok]
+      q <- function(t2) { w <- 1 / (v + t2); mu <- sum(w * y) / sum(w); sum(w * (y - mu)^2) - (k - 1) }
+      if (q(0) <= 0) return(0)                                         # no excess heterogeneity
+      up <- max(1, 2 * var(y)); while (q(up) > 0) up <- up * 2         # bracket the root
+      tryCatch(uniroot(q, c(0, up), tol = 1e-10)$root, error = function(e) NA_real_)   # Option A: root finding
+    }, numeric(1))
+    tau2 <- ifelse(is.na(tau_pm), tau2, tau_pm)                         # Option B: keep DL estimate if root finding fails
+  }
+  Ws <- 1 / (V + tau2); Ws[W == 0] <- 0
+  mu <- rowSums(Ws * Y, na.rm = TRUE) / rowSums(Ws)
+  se <- sqrt(1 / rowSums(Ws))
+  I2 <- pmax(0, (Q - (m - 1)) / pmax(Q, 1e-9)); I2[m <= 1] <- 0
+  crit <- rep(1.96, length(mu))                                         # normal quantile (DL)
+  if (method == "HK") {                                                # modified Hartung-Knapp: t quantile, scale >= 1
+    qhk <- rowSums(Ws * (Y - mu)^2, na.rm = TRUE) / pmax(m - 1, 1)
+    hk <- m >= 2
+    se[hk] <- sqrt(pmax(1, qhk[hk]) / rowSums(Ws)[hk])
+    crit[hk] <- qt(0.975, m[hk] - 1)
+  }
+  list(mu = mu, se = se, I2 = I2, m = m, crit = crit)
+}
+rb_method <- function(Ms, trim = 0.30, min_row = 3, pool_method = "DL", rts = NULL) {   # Ms: weighted strata matrices; rts: report totals (step11)
+  P <- length(Ms); nr <- nrow(Ms[[1]]); nc <- ncol(Ms[[1]])
+  Y <- V <- matrix(NA_real_, nr * nc, P); A <- rep(0, nr * nc)
+  for (s in seq_len(P)) {
+    M <- Ms[[s]]; rs <- if (is.null(rts)) rowSums(M) else rts[[s]]; tot <- sum(rs)
+    if (tot <= 0) next
+    dom <- rs / tot > trim                                              # dominant (masking) categories
+    colbg <- colSums(M[!dom, , drop = FALSE]); totbg <- sum(rs[!dom])  # equals sum(M[!dom, ]) at mention level
+    a  <- M; b <- rs - M
+    own_col <- matrix(rep(!dom, nc), nr, nc) * M                        # subtract own row only if it is in background
+    cc <- matrix(colbg, nr, nc, byrow = TRUE) - own_col
+    tb <- totbg - (!dom) * rs
+    d  <- matrix(tb, nr, nc) - cc
+    r  <- ror_stats(a, b, pmax(cc, 0), pmax(d, 0))
+    ok <- matrix(rs >= min_row & tb > 0, nr, nc)
+    Y[, s] <- ifelse(ok, r$lor, NA); V[, s] <- ifelse(ok, r$se^2, NA)
+    A <- A + as.vector(a)
+  }
+  pool <- tryCatch(re_pool(Y, V, method = pool_method), error = function(e) NULL)   # Option A: random effects
+  if (is.null(pool)) {                                                 # Option B: fixed effect
+    W <- 1 / V; W[!is.finite(W)] <- 0
+    mu <- rowSums(W * Y, na.rm = TRUE) / rowSums(W)
+    pool <- list(mu = mu, se = sqrt(1 / rowSums(W)), I2 = rep(NA, length(mu)), m = rowSums(W > 0), crit = rep(1.96, length(mu)))
+  }
+  low <- pool$mu - pool$crit * pool$se; low[!is.finite(low)] <- NA
+  list(low = matrix(low, nr, nc), I2 = matrix(pool$I2, nr, nc), m = matrix(pool$m, nr, nc),
+       mu = matrix(pool$mu, nr, nc), se = matrix(pool$se, nr, nc), A = matrix(A, nr, nc),   # pooled log-ROR, SE, weighted count
+       f = matrix(!is.na(low) & low > 0 & A >= 3, nr, nc))
+}
+
+# ---- 02.3 run every method on a count table ---------------------------
+# cnt: data.table with cat, ev, k (channel), r (regime), t (month), n, litig (logical)
+mat_of <- function(x, cats, evs) {                                     # data.table -> cat x ev matrix
+  M <- matrix(0, length(cats), length(evs), dimnames = list(cats, evs))
+  if (nrow(x)) {
+    agg <- x[, .(n = sum(n)), by = .(cat, ev)]
+    M[cbind(match(agg$cat, cats), match(agg$ev, evs))] <- agg$n
+  }
+  M
+}
+rowvec_of <- function(x, cats) {                                       # data.table (cat, n) -> reports per category
+  v <- setNames(numeric(length(cats)), cats)
+  if (nrow(x)) { agg <- x[, .(n = sum(n)), by = cat]; v[match(agg$cat, cats)] <- agg$n }
+  v
+}
+run_methods <- function(cnt, cats, evs, all_months, use_burst = TRUE, use_trim = TRUE,
+                        z = 3, win = 13, trim = 0.30, rb_only = FALSE, pool_method = "DL",
+                        align = "center", rl = NULL) {                     # defaults = main analysis; rl = report counts (step11)
+  strata <- unique(cnt[, .(k, r)])
+  rv <- function(x) if (is.null(rl)) NULL else rowvec_of(x, cats)       # report totals per category, or NULL (mention level)
+  cr <- mh <- sg_low <- sg_f <- NULL
+  if (!rb_only) {                                                      # comparators (skipped in sensitivity runs)
+    # crude (pooled, unweighted)
+    cr <- crude_methods(mat_of(cnt, cats, evs), rt = rv(rl))
+    # MH stratified by channel x regime
+    Ms <- lapply(seq_len(nrow(strata)), function(i) mat_of(cnt[k == strata$k[i] & r == strata$r[i]], cats, evs))
+    Rs <- if (is.null(rl)) NULL else lapply(seq_len(nrow(strata)), function(i) rv(rl[k == strata$k[i] & r == strata$r[i]]))
+    mh <- mh_method(Ms, Rs)
+    # subgroup by channel (signal in any channel)
+    sg <- lapply(unique(cnt$k), function(kk) crude_methods(mat_of(cnt[k == kk], cats, evs), rt = if (is.null(rl)) NULL else rv(rl[k == kk])))
+    sg_low <- Reduce(pmax, lapply(sg, function(q) ifelse(q$a >= 3, q$ror_low, -Inf)))
+    sg_f   <- Reduce(`|`, lapply(sg, function(q) q$f_ror))
+  }
+  # proposed: burst weights -> trimmed stratum RORs -> RE pooling
+  cw <- copy(cnt); rw <- if (is.null(rl)) NULL else copy(rl)
+  if (use_burst) {
+    cm <- (if (is.null(rl)) cnt else rl)[, .(y = sum(n)), by = .(cat, k, r, t)]   # monthly mentions (main) or reports (step11)
+    grid <- rbindlist(lapply(seq_len(nrow(strata)), function(i)
+      CJ(cat = cats, k = strata$k[i], r = strata$r[i], t = all_months[[strata$r[i]]])))
+    cm <- merge(grid, cm, by = c("cat", "k", "r", "t"), all.x = TRUE); cm[is.na(y), y := 0]
+    cm <- burst_weights(cm, z = z, win = win, align = align)
+    cw <- merge(cw, cm[, .(cat, k, r, t, w)], by = c("cat", "k", "r", "t"), all.x = TRUE)
+    cw[is.na(w), w := 1]; cw[, n := n * w]
+    if (!is.null(rw)) {                                                # same weights for the report totals
+      rw <- merge(rw, cm[, .(cat, k, r, t, w)], by = c("cat", "k", "r", "t"), all.x = TRUE)
+      rw[is.na(w), w := 1]; rw[, n := n * w]
+    }
+  } else cm <- NULL
+  Mw <- lapply(seq_len(nrow(strata)), function(i) mat_of(cw[k == strata$k[i] & r == strata$r[i]], cats, evs))
+  Rw <- if (is.null(rw)) NULL else lapply(seq_len(nrow(strata)), function(i) rowvec_of(rw[k == strata$k[i] & r == strata$r[i]], cats))
+  rb <- rb_method(Mw, trim = if (use_trim) trim else 1.01, pool_method = pool_method, rts = Rw)
+  list(cr = cr, mh = mh, sg_low = sg_low, sg_f = sg_f, rb = rb, bursts = cm)
+}
+
+# ---- 02.3b EBGM (DuMouchel gamma-Poisson shrinker, 2-gamma mixture prior) --------
+gps_fit <- function(N, E) {                                            # DuMouchel 2-gamma GPS by maximum likelihood
+  ldnb <- function(N, E, a, b) lgamma(a + N) - lgamma(a) - lgamma(N + 1) - N * log1p(b / E) - a * log1p(E / b)
+  nll <- function(th) { a1 <- exp(th[1]); b1 <- exp(th[2]); a2 <- exp(th[3]); b2 <- exp(th[4]); p <- plogis(th[5])
+    l1 <- log(p) + ldnb(N, E, a1, b1); l2 <- log1p(-p) + ldnb(N, E, a2, b2)
+    m <- pmax(l1, l2); -sum(m + log(exp(l1 - m) + exp(l2 - m))) }
+  starts <- list(c(.2, .1, 2, 4, 1/3), c(.1, .1, 10, 10, .2), c(.3, .5, 6, 6, .5))
+  fits <- lapply(starts, function(s) tryCatch(optim(c(log(s[1:4]), qlogis(s[5])), nll, method = "Nelder-Mead",
+                                                   control = list(maxit = 5000)), error = function(e) NULL))
+  fits <- Filter(Negate(is.null), fits); best <- fits[[which.min(sapply(fits, `[[`, "value"))]]
+  th <- best$par; c(a1 = exp(th[1]), b1 = exp(th[2]), a2 = exp(th[3]), b2 = exp(th[4]), p = plogis(th[5]))
+}
+gps_scores <- function(N, E, h) {
+  ldnb <- function(N, E, a, b) lgamma(a + N) - lgamma(a) - lgamma(N + 1) - N * log1p(b / E) - a * log1p(E / b)
+  l1 <- log(h["p"]) + ldnb(N, E, h["a1"], h["b1"]); l2 <- log1p(-h["p"]) + ldnb(N, E, h["a2"], h["b2"])
+  Q <- 1 / (1 + exp(l2 - l1))
+  ebgm <- exp(Q * (digamma(h["a1"] + N) - log(h["b1"] + E)) + (1 - Q) * (digamma(h["a2"] + N) - log(h["b2"] + E)))
+  eb05 <- mapply(function(n, e, q) {
+    f <- function(x) q * pgamma(x, h["a1"] + n, h["b1"] + e) + (1 - q) * pgamma(x, h["a2"] + n, h["b2"] + e) - 0.05
+    uniroot(f, c(1e-12, 1e4), tol = 1e-10)$root }, N, E, Q)
+  list(ebgm = as.numeric(ebgm), eb05 = as.numeric(eb05))
+}
+
+# ---- 02.4 real data ----------------------------------------------------
+if (!file.exists("step02_real_signals.csv") || !file.exists("step02_rules_v4.txt")) {   # re-run once with rules v4 (<2 min)
+  rc <- fread("step01_reports_clean.csv", encoding = "UTF-8", colClasses = "character")
+  rc <- rc[as.IDate(recv) >= as.IDate("2004-01-01")]                    # analysis window 2004-01 .. 2025-08
+  rc[, t := (as.integer(substr(ym, 1, 4)) - 2004) * 12 + as.integer(substr(ym, 6, 7))]  # month index
+  long <- rc[, .(ev = unlist(strsplit(event_groups, "|", fixed = TRUE))),
+             by = .(report_number, cat = category, k = channel, r = regime, t, litig = litig_flag == "TRUE")]
+  cnt <- long[, .(n = .N), by = .(cat, ev, k, r, t, litig)]
+  cats <- sort(unique(cnt$cat)); evs <- sort(unique(cnt$ev))
+  all_months <- list(pre = sort(unique(cnt[r == "pre", t])), post = sort(unique(cnt[r == "post", t])))
+  all_months$pre  <- seq(min(all_months$pre),  max(all_months$pre))
+  all_months$post <- seq(min(all_months$post), max(all_months$post))
+  fwrite(cnt[, .(n = sum(n)), by = .(cat, ev, k, r)][order(cat, ev, k, r)], "step02_real_counts.csv", bom = TRUE)
+
+  res  <- run_methods(cnt, cats, evs, all_months)
+  res0 <- run_methods(cnt, cats, evs, all_months, use_burst = FALSE)     # ablation: no burst weights
+  res1 <- run_methods(cnt, cats, evs, all_months, use_trim = FALSE)      # ablation: no trimming
+  orc  <- crude_methods(mat_of(cnt[litig == FALSE], cats, evs))          # litigation-type reports removed
+
+  pr <- CJ(cat = cats, ev = evs, sorted = FALSE)
+  idx <- cbind(match(pr$cat, cats), match(pr$ev, evs))
+  out <- pr[, `:=`(
+    a = res$cr$a[idx], E = round(res$cr$E[idx], 2),
+    prr = round(res$cr$prr[idx], 3), f_prr = res$cr$f_prr[idx],
+    ror_low = round(res$cr$ror_low[idx], 3), f_ror = res$cr$f_ror[idx],
+    ic025 = round(res$cr$ic025[idx], 3), f_ic = res$cr$f_ic[idx],
+    mh_low = round(res$mh$low[idx], 3), f_mh = res$mh$f[idx],
+    sub_low = round(res$sg_low[idx], 3), f_sub = res$sg_f[idx],
+    rb_low = round(res$rb$low[idx], 3), rb_I2 = round(res$rb$I2[idx], 3), rb_strata = res$rb$m[idx], f_rb = res$rb$f[idx],
+    f_rb_noburst = res0$rb$f[idx], f_rb_notrim = res1$rb$f[idx],
+    nolitig_low = round(orc$ror_low[idx], 3), f_nolitig = orc$f_ror[idx])]
+
+  # EBGM on the crude table (Option A openEBGM, Option B single-gamma shrinker)
+  out[, `:=`(ebgm = NA_real_, eb05 = NA_real_, f_ebgm = NA, ebgm_method = "openEBGM_GPS")]
+  eb_ok <- tryCatch({
+    if (!requireNamespace("openEBGM", quietly = TRUE)) install.packages("openEBGM")
+    proc <- data.frame(var1 = out$cat, var2 = out$ev, N = out$a, E = pmax(out$E, 1e-6))
+    proc$RR <- proc$N / proc$E; proc$PRR <- out$prr
+    th <- data.frame(alpha1 = c(.2, .1, .3), beta1 = c(.1, .1, .5), alpha2 = c(2, 10, 6), beta2 = c(4, 10, 6), p = c(1/3, .2, .5))
+    hy <- openEBGM::autoHyper(proc, theta_init = th, squashed = FALSE, zeroes = TRUE, N_star = NULL)   # N_star must be NULL when zeroes are used
+    eb <- openEBGM::ebScores(proc, hyper_estimate = hy, quantiles = 5)
+    out[, `:=`(ebgm = eb$data$EBGM, eb05 = eb$data$QUANT_05)]
+    TRUE
+  }, error = function(e) { cat("EBGM Option A failed:", conditionMessage(e), "\n"); FALSE })
+  if (!eb_ok) {                                                       # Option B: own DuMouchel 2-gamma GPS (same model as openEBGM)
+    eb_ok <- tryCatch({
+      h <- gps_fit(out$a, pmax(out$E, 1e-6))
+      sc <- gps_scores(out$a, pmax(out$E, 1e-6), h)
+      out[, `:=`(ebgm = sc$ebgm, eb05 = sc$eb05, ebgm_method = "own_GPS_2gamma")]
+      fwrite(data.table(param = names(h), value = round(as.numeric(h), 5)), "step02_real_ebgm_hyper.csv", bom = TRUE)
+      TRUE
+    }, error = function(e) { cat("EBGM Option B failed:", conditionMessage(e), "\n"); FALSE })
+  }
+  if (!eb_ok) {                                                       # last resort: single-gamma shrinker
+    nll <- function(p) { al <- exp(p[1]); be <- exp(p[2]); N <- out$a; E <- out$E
+      -sum(lgamma(N + al) - lgamma(al) - lgamma(N + 1) + al * log(be / (be + E)) + N * log(E / (be + E))) }
+    fit <- optim(c(0, 0), nll); al <- exp(fit$par[1]); be <- exp(fit$par[2])
+    out[, `:=`(ebgm = exp(digamma(al + a) - log(be + E)), eb05 = qgamma(0.05, al + a, be + E), ebgm_method = "single_gamma")]
+  }
+  out[, f_ebgm := !is.na(eb05) & eb05 >= 2]
+  fwrite(out, "step02_real_signals.csv", bom = TRUE)
+
+  fl <- grep("^f_", names(out), value = TRUE)
+  summ <- rbindlist(lapply(fl, function(f) data.table(method = sub("^f_", "", f), n_signals = sum(out[[f]], na.rm = TRUE),
+                                                       agree_with_rb = sum(out[[f]] == out$f_rb, na.rm = TRUE))))
+  fwrite(summ, "step02_real_summary.csv", bom = TRUE)
+  b <- res$bursts[w < 1][order(-y)]
+  fwrite(b[, .(cat, channel = k, regime = r, t, year = 2004 + (t - 1) %/% 12, month = (t - 1) %% 12 + 1,
+               y, base = round(base, 1), weight = round(w, 3))], "step02_real_bursts.csv", bom = TRUE)
+  writeLines("EBGM fix v4", "step02_ebgm_v4.txt")                     # marker: real-data block done with fixed EBGM
+  writeLines("rules v4", "step02_rules_v4.txt")                        # marker: real-data block done with rules v4
+  cat("Real-data signals written\n")
+} else cat("step02 real-data outputs found -> skipped\n")
+
+# ---- 02.5 Monte Carlo ---------------------------------------------------
+sim_one <- function(M_reg, litig, comp_shift, seed, C = 15, E = 12, Tm = 120, Tpre = 96, n_sig = 18) {
+  set.seed(seed)
+  norm <- function(x) x / sum(x)
+  piD <- norm(rgamma(C, 1.5)); piIpre <- norm(piD * exp(rnorm(C, 0, .5)))
+  piIpost <- if (comp_shift) norm(piIpre * exp(rnorm(C, 0, 1))) else piIpre
+  phiD <- norm(rgamma(E, 1.5)); phiI <- norm(phiD * exp(rnorm(E, 0, .7)))   # channel-specific event coding
+  RR <- matrix(1, C, E); cand <- setdiff(seq_len(C * E), 1)                 # pair (1,1) = litigated pair, no true signal
+  sig <- sample(cand, n_sig); RR[sig] <- sample(c(1.5, 2, 3), n_sig, replace = TRUE)
+  Pk <- function(phi) { X <- sweep(RR, 2, phi, "*"); X / rowSums(X) }
+  PD <- Pk(phiD); PI <- Pk(phiI)
+  cats <- sprintf("c%02d", seq_len(C)); evs <- sprintf("e%02d", seq_len(E))
+  mk <- function(k, r, tt, lam, pic, P) {                                # Poisson counts for one stratum
+    mu <- as.vector(lam * pic * P)                                       # C x E means per month
+    n <- rpois(length(mu) * length(tt), rep(mu, length(tt)))
+    data.table(cat = rep(rep(cats, E), length(tt)), ev = rep(rep(evs, each = C), length(tt)),
+               k = k, r = r, t = rep(tt, each = C * E), n = n, litig = FALSE)[n > 0]
+  }
+  pre <- seq_len(Tpre); post <- (Tpre + 1):Tm
+  cnt <- rbind(mk("Direct", "pre", pre, 60, piD, PD), mk("Direct", "post", post, 30, piD, PD),
+               mk("Industry", "pre", pre, 8, piIpre, PI), mk("Industry", "post", post, 8 * M_reg, piIpost, PI))
+  if (litig == "burst") {                                               # 6-month dump, ~15000 reports
+    tt <- 70:75; cnt <- rbind(cnt, data.table(cat = "c01", ev = "e01", k = "Industry", r = "pre", t = tt, n = rpois(6, 2500), litig = TRUE))
+  }
+  if (litig == "notoriety") {                                           # media-driven consumer burst, ~1500 reports
+    tt <- 70:75; cnt <- rbind(cnt, data.table(cat = "c01", ev = "e01", k = "Direct", r = "pre", t = tt, n = rpois(6, 250), litig = TRUE))
+  }
+  if (litig == "sustained") {                                           # long-running stream, ~250/month
+    tt <- 40:Tm; cnt <- rbind(cnt, data.table(cat = "c01", ev = "e01", k = "Industry", r = ifelse(tt <= Tpre, "pre", "post"),
+                                              t = tt, n = rpois(length(tt), 250), litig = TRUE))
+  }
+  cnt <- cnt[, .(n = sum(n)), by = .(cat, ev, k, r, t, litig)]
+  am <- list(pre = pre, post = post)
+  res <- run_methods(cnt, cats, evs, am)
+  res0 <- run_methods(cnt, cats, evs, am, use_burst = FALSE)
+  res1 <- run_methods(cnt, cats, evs, am, use_trim = FALSE)
+  orc <- crude_methods(mat_of(cnt[litig == FALSE], cats, evs))
+  truth <- as.vector(RR > 1); litpair <- seq_len(C * E) == 1
+  stat <- list(prr = log(pmax(res$cr$prr, 1e-9)), ror = res$cr$ror_low, ic = res$cr$ic025, mh = res$mh$low,
+               sub = res$sg_low, rb = res$rb$low, rb_noburst = res0$rb$low, rb_notrim = res1$rb$low, oracle = orc$ror_low)
+  flag <- list(prr = res$cr$f_prr, ror = res$cr$f_ror, ic = res$cr$f_ic, mh = res$mh$f, sub = res$sg_f,
+               rb = res$rb$f, rb_noburst = res0$rb$f, rb_notrim = res1$rb$f, oracle = orc$f_ror)
+  auc <- function(s) { s <- as.vector(s); s[!is.finite(s)] <- -1e6; s <- s[!litpair]; y <- truth[!litpair]
+    rk <- rank(s); n1 <- sum(y); n0 <- sum(!y); (sum(rk[y]) - n1 * (n1 + 1) / 2) / (n1 * n0) }
+  rbindlist(lapply(names(flag), function(m) {
+    f <- as.vector(flag[[m]]); f[is.na(f)] <- FALSE
+    data.table(method = m, power = mean(f[truth]), fpr = mean(f[!truth & !litpair]),
+               lit_flag = f[litpair], auc = auc(stat[[m]]))
+  }))
+}
+
+if (!file.exists("step02_mc_summary.csv")) {
+  R_rep <- 500                                                          # replications per scenario
+  grid <- CJ(M_reg = c(1, 5, 15), litig = c("none", "burst", "sustained", "notoriety"), comp_shift = c(FALSE, TRUE))
+  jobs <- grid[rep(seq_len(.N), each = R_rep)][, `:=`(rep = rep(seq_len(R_rep), nrow(grid)), seed = 20261118 + .I)]
+  run_job <- function(i) {
+    j <- jobs[i]
+    out <- sim_one(j$M_reg, j$litig, j$comp_shift, j$seed)
+    out[, `:=`(M_reg = j$M_reg, litig = j$litig, comp_shift = j$comp_shift, rep = j$rep)]
+    out
+  }
+  t0 <- Sys.time()
+  mc <- tryCatch({                                                      # Option A: parallel workers
+    ncore <- max(1, parallel::detectCores() - 1)
+    cl <- parallel::makeCluster(ncore)
+    parallel::clusterEvalQ(cl, suppressPackageStartupMessages(library(data.table)))
+    parallel::clusterExport(cl, c("jobs", "sim_one", "run_methods", "mat_of", "crude_methods", "mh_method",
+                                  "rb_method", "re_pool", "burst_weights", "tab2", "ror_stats"), envir = environment())
+    r <- tryCatch(rbindlist(parallel::parLapply(cl, seq_len(nrow(jobs)), run_job)),
+                  finally = try(parallel::stopCluster(cl), silent = TRUE))
+    r
+  }, error = function(e) { cat("MC Option A (parallel) failed:", conditionMessage(e), "-> sequential\n"); NULL })
+  if (is.null(mc)) mc <- rbindlist(lapply(seq_len(nrow(jobs)), run_job))   # Option B: sequential
+  cat("MC time:", round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), "min\n")
+  fwrite(mc, "step02_mc_raw.csv", bom = TRUE)
+  ms <- mc[, .(power = round(mean(power), 3), fpr = round(mean(fpr), 4), lit_flag_rate = round(mean(lit_flag), 3),
+               auc = round(mean(auc), 3), n_rep = .N), by = .(M_reg, litig, comp_shift, method)]
+  fwrite(ms[order(M_reg, litig, comp_shift, method)], "step02_mc_summary.csv", bom = TRUE)
+} else cat("step02 Monte Carlo outputs found -> skipped\n")
+
+cat("\nstep02 finished.\n")
+
+# ======================================================================
+# STEP 03 : main figures (Fig 1-4), supplementary figures (S1-S2), tables
+# Figures: 1200 dpi PNG + PDF, same file names are overwritten on re-run
+# ======================================================================
+cat("\n--- step03 ---\n")
+for (p in c("ggplot2", "scales")) if (!requireNamespace(p, quietly = TRUE)) install.packages(p)  # install if missing
+suppressPackageStartupMessages({ library(ggplot2); library(scales) })
+
+okabe <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")  # colour-blind safe
+theme_pap <- theme_classic(base_size = 9) +
+  theme(strip.background = element_blank(), strip.text = element_text(face = "bold"),
+        legend.position = "bottom", legend.title = element_blank(), panel.grid.major.y = element_line(colour = "grey92"))
+
+save_fig <- function(p, name, w, h) {                                  # PNG 1200 dpi + PDF, two ways each
+  png_ok <- tryCatch({ ggsave(paste0(name, ".png"), p, width = w, height = h, dpi = 1200, device = ragg::agg_png); TRUE },
+                     error = function(e) FALSE)                          # Option A: ragg
+  if (!png_ok) {                                                       # Option B: base png device
+    png(paste0(name, ".png"), width = w, height = h, units = "in", res = 1200, type = "cairo"); print(p); dev.off()
+  }
+  pdf_ok <- tryCatch({ ggsave(paste0(name, ".pdf"), p, width = w, height = h, device = cairo_pdf); TRUE },
+                     error = function(e) FALSE)                          # Option A: cairo_pdf
+  if (!pdf_ok) { pdf(paste0(name, ".pdf"), width = w, height = h); print(p); dev.off() }  # Option B: base pdf
+  cat("saved", name, "\n")
+}
+
+pretty_cat <- function(x) {                                            # readable category labels
+  map <- c(baby_other = "Baby products", deodorant = "Deodorant", eye_makeup = "Eye make-up", fragrance = "Fragrance",
+           hair_care = "Hair care", hair_dye = "Hair dye/henna", hair_removal = "Hair removal", hair_straightener = "Hair straightener",
+           makeup_lip = "Make-up/lip", nail = "Nail", oral_care = "Oral care", other = "Other", powder_talc = "Talc/body powder",
+           skin_care = "Skin care", sun_tan = "Sun/tanning", tattoo = "Tattoo/ink")
+  out <- unname(map[x]); out[is.na(out)] <- x[is.na(out)]; out
+}
+pretty_ev <- function(x) {
+  map <- c(allergy_swelling = "Allergy/swelling", burn_wound = "Burn/wound", cancer = "Cancer", death = "Death",
+           eye = "Eye", hair_loss = "Hair loss/damage", infection = "Infection", injury_exposure = "Injury/exposure",
+           other = "Other", respiratory = "Respiratory", skin_irritation = "Skin irritation", systemic = "Systemic")
+  out <- unname(map[x]); out[is.na(out)] <- x[is.na(out)]; out
+}
+meth_lab <- c(prr = "PRR", ror = "ROR", ic = "IC025", ebgm = "EBGM", mh = "MH-ROR", sub = "Subgroup ROR",
+              rb = "RB (proposed)", oracle = "Oracle ROR", rb_noburst = "RB without burst weights",
+              rb_notrim = "RB without trimming")
+litig_lab <- c(none = "No shock", burst = "Litigation burst", sustained = "Sustained litigation", notoriety = "Notoriety burst")
+
+rc <- fread("step01_reports_clean.csv", encoding = "UTF-8", colClasses = "character")
+rc <- rc[as.IDate(recv) >= as.IDate("2004-01-01")]                     # same window as step02
+rc[, litig := litig_flag == "TRUE"]
+
+# ---- Figure 1: monthly reports by channel, litigation-type vs other ----
+mon <- rc[, .N, by = .(ym, channel, litig)]
+grid <- CJ(ym = format(seq(as.Date("2004-01-01"), as.Date("2025-08-01"), by = "month"), "%Y-%m"),
+           channel = c("Direct", "Industry"), litig = c(FALSE, TRUE))
+mon <- merge(grid, mon, all.x = TRUE); mon[is.na(N), N := 0]
+mon[, date := as.Date(paste0(ym, "-01"))]
+mon[, panel := factor(fifelse(litig, "Litigation-type reports (talc/powder or cancer)", "All other reports"),
+                      levels = c("All other reports", "Litigation-type reports (talc/powder or cancer)"))]
+mon[, channel := factor(channel, c("Direct", "Industry"), c("Direct (consumer/health professional)", "Industry (manufacturer)"))]
+f1 <- ggplot(mon, aes(date, N, colour = channel)) +
+  geom_line(linewidth = 0.35) +
+  geom_vline(xintercept = as.Date("2023-12-29"), linetype = "dashed", linewidth = 0.3) +
+  annotate("text", x = as.Date("2023-10-01"), y = 4000, label = "MoCRA", hjust = 1, size = 2.6) +
+  facet_wrap(~panel, ncol = 1) +
+  scale_y_continuous(trans = pseudo_log_trans(sigma = 1, base = 10), breaks = c(0, 10, 100, 1000, 5000)) +
+  scale_x_date(date_breaks = "2 years", date_labels = "%Y", expand = c(0.01, 0)) +
+  scale_colour_manual(values = okabe[c(6, 7)]) +
+  labs(x = NULL, y = "Reports per month (pseudo-log scale)") + theme_pap
+save_fig(f1, "step03_fig1_monthly_reports", 7, 5)
+
+# ---- Figure 2: category composition of non-litigation reports, pre vs post
+cmp <- rc[litig == FALSE, .N, by = .(channel, regime, category)]
+cmp <- merge(CJ(channel = c("Direct", "Industry"), regime = c("pre", "post"), category = unique(cmp$category)),
+             cmp, all.x = TRUE)                                        # keep zero-count categories (shown at 0)
+cmp[is.na(N), N := 0]
+cmp[, share := N / sum(N), by = .(channel, regime)]
+ord <- cmp[, .(s = mean(share)), by = category][order(s), category]
+cmp[, cat_lab := factor(pretty_cat(category), levels = pretty_cat(ord))]
+cmp[, regime := factor(regime, c("pre", "post"), c("Before MoCRA (voluntary)", "After MoCRA (mandatory)"))]
+cmp[, channel := factor(channel, c("Direct", "Industry"), c("Direct", "Industry"))]
+bg2 <- data.table(channel = factor(c("Direct", "Industry")), fill = c("white", "grey93"))  # panel backgrounds differ
+f2 <- ggplot(cmp, aes(share, cat_lab, colour = regime, shape = regime)) +
+  geom_rect(data = bg2, aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = fill),
+            inherit.aes = FALSE, alpha = 0.6, show.legend = FALSE) +
+  scale_fill_identity() +
+  geom_point(size = 1.8) +
+  facet_wrap(~channel, nrow = 1) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_colour_manual(values = okabe[c(3, 7)]) +
+  labs(x = "Share of non-litigation reports in the channel", y = NULL) + theme_pap
+save_fig(f2, "step03_fig2_category_composition", 7, 4.2)
+
+# ---- Figure 3: Monte Carlo false-positive rate and power (no composition shift)
+ms <- fread("step02_mc_summary.csv")
+main_m <- c("prr", "ror", "ic", "mh", "sub", "rb", "oracle")
+mc_plot <- function(dd) {
+  dd <- dd[method %in% main_m]
+  long <- rbind(dd[, .(M_reg, litig, method, metric = "False-positive rate", value = fpr)],
+                dd[, .(M_reg, litig, method, metric = "Power", value = power)])
+  long[, method := factor(meth_lab[method], levels = meth_lab[main_m])]
+  long[, litig := factor(litig_lab[litig], levels = litig_lab)]
+  long[, metric := factor(metric, c("False-positive rate", "Power"))]
+  hl <- data.table(metric = factor("False-positive rate", levels(long$metric)), y = 0.05)
+  bg <- data.table(metric = factor(levels(long$metric), levels(long$metric)), fill = c("white", "grey93"))  # row backgrounds differ
+  ggplot(long, aes(factor(M_reg), value, colour = method, group = method)) +
+    geom_rect(data = bg, aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = fill),
+              inherit.aes = FALSE, alpha = 0.6, show.legend = FALSE) +
+    scale_fill_identity() +
+    geom_hline(data = hl, aes(yintercept = y), linetype = "dotted", linewidth = 0.3) +
+    geom_line(linewidth = 0.4) + geom_point(size = 1.2) +
+    facet_grid(metric ~ litig, scales = "free_y") +
+    scale_colour_manual(values = okabe[c(1, 2, 3, 4, 8, 7, 6)]) +
+    scale_y_continuous(labels = percent_format(accuracy = 1)) +
+    labs(x = "Industry reporting multiplier after MoCRA", y = NULL) + theme_pap +
+    guides(colour = guide_legend(nrow = 1))
+}
+save_fig(mc_plot(ms[comp_shift == FALSE]), "step03_fig3_mc_fpr_power", 7.5, 4.6)
+save_fig(mc_plot(ms[comp_shift == TRUE]), "step03_figS2_mc_fpr_power_compshift", 7.5, 4.6)
+
+# ---- Figure 4: real-data signal agreement, crude ROR vs RB -------------
+sig <- fread("step02_real_signals.csv")
+sig[, agree := fcase(f_ror & f_rb, "Signal in both", f_ror & !f_rb, "Crude ROR only",
+                     !f_ror & f_rb, "RB only", default = "No signal")]
+sig[, agree := factor(agree, c("Signal in both", "Crude ROR only", "RB only", "No signal"))]
+sig[, cat_lab := factor(pretty_cat(cat), levels = rev(sort(unique(pretty_cat(cat)))))]
+sig[, ev_lab := pretty_ev(ev)]
+f4 <- ggplot(sig, aes(ev_lab, cat_lab, fill = agree)) +
+  geom_tile(colour = "white", linewidth = 0.4) +
+  scale_fill_manual(values = c("Signal in both" = okabe[6], "Crude ROR only" = okabe[2],
+                               "RB only" = okabe[4], "No signal" = "grey90"), drop = FALSE) +
+  labs(x = NULL, y = NULL) + theme_pap +
+  theme(axis.text.x = element_text(angle = 40, hjust = 1), axis.line = element_blank(), axis.ticks = element_blank())
+save_fig(f4, "step03_fig4_signal_agreement", 6.5, 5.2)
+
+# ---- Figure S1: ablation of the RB components ---------------------------
+ab <- ms[method %in% c("rb", "rb_noburst", "rb_notrim"),
+         .(fpr = mean(fpr), power = mean(power)), by = .(litig, method)]
+ab[, method := factor(meth_lab[method], levels = meth_lab[c("rb", "rb_noburst", "rb_notrim")])]
+ab[, litig := factor(litig_lab[litig], levels = litig_lab)]
+fs1 <- ggplot(ab, aes(litig, fpr, fill = method)) +
+  geom_col(position = position_dodge(0.75), width = 0.7) +
+  geom_hline(yintercept = 0.05, linetype = "dotted", linewidth = 0.3) +
+  scale_fill_manual(values = okabe[c(7, 3, 2)]) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = NULL, y = "False-positive rate (mean over scenarios)") + theme_pap
+save_fig(fs1, "step03_figS1_ablation", 6.5, 3.6)
+
+# ---- Table 1: data summary by channel and regime ------------------------
+t1 <- rc[, .(reports = .N,
+             litigation_type_pct = round(100 * mean(litig), 1),
+             serious_pct = round(100 * mean(serious == "TRUE"), 1),
+             deaths = sum(death == "TRUE"),
+             median_terms = as.numeric(median(as.integer(n_reactions))),
+             categories = uniqueN(category)), by = .(channel, regime)]
+t1[, regime := factor(regime, c("pre", "post"))]
+t1 <- t1[order(channel, regime)]
+tot <- rc[, .(channel = "All", regime = "All", reports = .N,             # overall total row
+              litigation_type_pct = round(100 * mean(litig), 1),
+              serious_pct = round(100 * mean(serious == "TRUE"), 1),
+              deaths = sum(death == "TRUE"),
+              median_terms = as.numeric(median(as.integer(n_reactions))),
+              categories = uniqueN(category))]
+t1 <- rbind(t1[, regime := as.character(regime)], tot)
+fwrite(t1, "step03_table1_data_summary.csv", bom = TRUE)
+
+# ---- Table 2: Monte Carlo summary with Monte Carlo standard errors -------
+raw <- fread("step02_mc_raw.csv")
+t2 <- raw[method %in% c(main_m), .(
+  fpr = round(mean(fpr), 4), fpr_mcse = round(sd(fpr) / sqrt(.N), 4),
+  power = round(mean(power), 3), power_mcse = round(sd(power) / sqrt(.N), 4),
+  auc = round(mean(auc), 3), litigated_pair_flag = round(mean(lit_flag), 3), n_datasets = .N),
+  by = .(scenario = litig, method)]
+t2[, scenario := factor(scenario, names(litig_lab))]; t2[, method := factor(method, main_m)]
+t2 <- t2[order(scenario, method)]
+t2[, `:=`(scenario = litig_lab[as.character(scenario)], method = meth_lab[as.character(method)])]
+fwrite(t2, "step03_table2_mc_summary.csv", bom = TRUE)
+
+# ---- Supplementary tables ----------------------------------------------
+fwrite(ms, "step03_tableS1_mc_full_grid.csv", bom = TRUE)              # all 24 scenarios x 9 methods
+fwrite(rbind(data.table(type = "product category", label = names(cat_rules), rule = unlist(cat_rules)),
+             data.table(type = "event group", label = names(ev_rules), rule = unlist(ev_rules))),
+       "step03_tableS2_classification_rules.csv", bom = TRUE)          # keyword rules (first match wins)
+fl <- grep("^f_", names(sig), value = TRUE)
+fwrite(sig[, c("cat", "ev", "a", "E", fl, "rb_low", "rb_I2"), with = FALSE][order(cat, ev)],
+       "step03_tableS3_real_signals_by_method.csv", bom = TRUE)        # pair-level flags for all methods
+cat("step03 finished\n")
+
+# ======================================================================
+# STEP 04 : robustness analyses
+#   04.1 extended simulator (shock spread over k categories; RB tuning)
+#   04.2 sensitivity of the RB tuning constants (simulation + real data)
+#   04.3 litigation spread over 3 or 5 categories
+#   04.4 alternative litigation-type definitions and deaths (real data)
+#   04.5 Figure S3 and supplementary tables S4-S6
+# Same 500 replications and the same seeds as the main Monte Carlo.
+# ======================================================================
+cat("\n--- step04 ---\n")
+R_rep <- 500                                                           # same replication count as step02
+
+# ---- 04.1 extended simulator ---------------------------------------------
+# Identical to sim_one when n_spread = 1 and default tuning (same random stream);
+# n_spread > 1 splits the shock evenly over categories c01..c0k with event e01.
+sim_ext <- function(M_reg, litig, comp_shift, seed, n_spread = 1, rb_only = FALSE,
+                    z = 3, win = 13, trim = 0.30, C = 15, E = 12, Tm = 120, Tpre = 96, n_sig = 18,
+                    pool_method = "DL", align = "center",                   # pool_method "HK" step05, "PM" and align step10
+                    sev_shift = 1, shock_mult = 1,                          # step11: serious-event enrichment, larger shocks
+                    shock_rr = 1, shock_len = 6) {                          # step12: true RR of the shocked pair, burst length
+  set.seed(seed)
+  norm <- function(x) x / sum(x)
+  piD <- norm(rgamma(C, 1.5)); piIpre <- norm(piD * exp(rnorm(C, 0, .5)))
+  piIpost <- if (comp_shift) norm(piIpre * exp(rnorm(C, 0, 1))) else piIpre
+  phiD <- norm(rgamma(E, 1.5)); phiI <- norm(phiD * exp(rnorm(E, 0, .7)))
+  shocked <- seq_len(n_spread)                                          # pairs (c01..c0k, e01): never true signals
+  RR <- matrix(1, C, E); cand <- setdiff(seq_len(C * E), shocked)
+  sig <- sample(cand, n_sig); RR[sig] <- sample(c(1.5, 2, 3), n_sig, replace = TRUE)
+  if (shock_rr != 1) RR[shocked] <- shock_rr                            # step12: shocked pair is also a true signal (no extra draws)
+  Pk <- function(phi) { X <- sweep(RR, 2, phi, "*"); X / rowSums(X) }
+  PD <- Pk(phiD); PI <- Pk(phiI)
+  PIpost <- if (sev_shift != 1) Pk(phiI * rep(c(1, sev_shift), c(E - 4, 4))) else PI   # step11: last 4 event groups = serious
+  cats <- sprintf("c%02d", seq_len(C)); evs <- sprintf("e%02d", seq_len(E))
+  mk <- function(k, r, tt, lam, pic, P) {
+    mu <- as.vector(lam * pic * P)
+    n <- rpois(length(mu) * length(tt), rep(mu, length(tt)))
+    data.table(cat = rep(rep(cats, E), length(tt)), ev = rep(rep(evs, each = C), length(tt)),
+               k = k, r = r, t = rep(tt, each = C * E), n = n, litig = FALSE)[n > 0]
+  }
+  pre <- seq_len(Tpre); post <- (Tpre + 1):Tm
+  cnt <- rbind(mk("Direct", "pre", pre, 60, piD, PD), mk("Direct", "post", post, 30, piD, PD),
+               mk("Industry", "pre", pre, 8, piIpre, PI), mk("Industry", "post", post, 8 * M_reg, piIpost, PIpost))
+  shock <- function(tt, lam, k) rbindlist(lapply(shocked, function(i)   # shock rows, mean lam per month in total
+    data.table(cat = cats[i], ev = "e01", k = k, r = ifelse(tt <= Tpre, "pre", "post"), t = tt,
+               n = rpois(length(tt), lam * shock_mult / n_spread), litig = TRUE)))
+  if (litig == "burst")     cnt <- rbind(cnt, shock(70:(69 + shock_len), 2500, "Industry"))
+  if (litig == "notoriety") cnt <- rbind(cnt, shock(70:(69 + shock_len), 250, "Direct"))
+  if (litig == "sustained") cnt <- rbind(cnt, shock(40:Tm, 250, "Industry"))
+  cnt <- cnt[, .(n = sum(n)), by = .(cat, ev, k, r, t, litig)]
+  am <- list(pre = pre, post = post)
+  truth <- as.vector(RR > 1); isshock <- seq_len(C * E) %in% shocked
+  res <- run_methods(cnt, cats, evs, am, z = z, win = win, trim = trim, rb_only = rb_only, pool_method = pool_method, align = align)
+  if (rb_only) {
+    stat <- list(rb = res$rb$low); flag <- list(rb = res$rb$f)
+  } else {
+    orc <- crude_methods(mat_of(cnt[litig == FALSE], cats, evs))
+    stat <- list(prr = log(pmax(res$cr$prr, 1e-9)), ror = res$cr$ror_low, ic = res$cr$ic025, mh = res$mh$low,
+                 sub = res$sg_low, rb = res$rb$low, oracle = orc$ror_low)
+    flag <- list(prr = res$cr$f_prr, ror = res$cr$f_ror, ic = res$cr$f_ic, mh = res$mh$f, sub = res$sg_f,
+                 rb = res$rb$f, oracle = orc$f_ror)
+  }
+  auc <- function(s) { s <- as.vector(s); s[!is.finite(s)] <- -1e6; s <- s[!isshock]; y <- truth[!isshock]
+    rk <- rank(s); n1 <- sum(y); n0 <- sum(!y); (sum(rk[y]) - n1 * (n1 + 1) / 2) / (n1 * n0) }
+  rbindlist(lapply(names(flag), function(m) {
+    f <- as.vector(flag[[m]]); f[is.na(f)] <- FALSE
+    data.table(method = m, power = mean(f[truth & !isshock]), fpr = mean(f[!truth & !isshock]),
+               lit_flag = mean(f[isshock]), auc = auc(stat[[m]]),
+               shock_share = sum(cnt[litig == TRUE, n]) / sum(cnt$n))   # step11: share of shocked reports in the database
+  }))
+}
+
+# seeds of the main Monte Carlo (same construction as step02), used for paired comparisons
+grid_main <- CJ(M_reg = c(1, 5, 15), litig = c("none", "burst", "sustained", "notoriety"), comp_shift = c(FALSE, TRUE))
+jobs_main <- grid_main[rep(seq_len(.N), each = R_rep)][, `:=`(rep = rep(seq_len(R_rep), nrow(grid_main)), seed = 20261118 + .I)]
+base_jobs <- jobs_main[M_reg == 5 & comp_shift == FALSE]               # 4 shocks x 500, regime multiplier 5
+
+run_parallel <- function(jobs, fun, extra = character()) {             # Option A parallel, Option B sequential; extra = more globals to export
+  t0 <- Sys.time()
+  out <- tryCatch({
+    ncore <- max(1, parallel::detectCores() - 1)
+    cl <- parallel::makeCluster(ncore)
+    parallel::clusterEvalQ(cl, suppressPackageStartupMessages(library(data.table)))
+    parallel::clusterExport(cl, c("sim_ext", "run_methods", "mat_of", "rowvec_of", "crude_methods", "mh_method",
+                                  "rb_method", "re_pool", "burst_weights", "tab2", "ror_stats", extra), envir = globalenv())
+    parallel::clusterExport(cl, c("jobs", "fun"), envir = environment())
+    r <- tryCatch(rbindlist(parallel::parLapply(cl, seq_len(nrow(jobs)), function(i) fun(jobs[i]))),
+                  finally = try(parallel::stopCluster(cl), silent = TRUE))
+    r
+  }, error = function(e) { cat("Option A (parallel) failed:", conditionMessage(e), "-> sequential\n"); NULL })
+  if (is.null(out)) out <- rbindlist(lapply(seq_len(nrow(jobs)), function(i) fun(jobs[i])))
+  cat("  time:", round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 1), "min\n")
+  out
+}
+
+# reproducibility check: sim_ext must reproduce the stored main results for a few databases
+mc_raw <- fread("step02_mc_raw.csv")
+chk <- rbindlist(lapply(c(0, 1, 2, 3) * R_rep + 1, function(i) {         # first database of each shock
+  j <- base_jobs[i]
+  o <- sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed)[method == "rb"]
+  s <- mc_raw[M_reg == j$M_reg & litig == j$litig & comp_shift == j$comp_shift & rep == j$rep & method == "rb"]
+  data.table(litig = j$litig, rep = j$rep, fpr_new = o$fpr, fpr_stored = s$fpr, power_new = o$power, power_stored = s$power)
+}))
+print(chk)
+fwrite(chk, "step04_reproducibility_check.csv", bom = TRUE)
+if (any(abs(chk$fpr_new - chk$fpr_stored) > 1e-9)) cat("WARNING: sim_ext does not reproduce step02 results\n")
+
+# ---- 04.2 sensitivity of the tuning constants (simulation) ---------------
+variants <- data.table(variant = c("Window 9 months", "Window 19 months", "Multiplier z = 2", "Multiplier z = 4",
+                                   "Dominance 20%", "Dominance 40%"),
+                       win = c(9, 19, 13, 13, 13, 13), z = c(3, 3, 2, 4, 3, 3), trim = c(.3, .3, .3, .3, .2, .4))
+if (!file.exists("step04_sens_raw.csv")) {
+  jobs <- variants[, as.list(base_jobs), by = .(variant, win, z, trim)]  # 6 variants x 4 shocks x 500
+  fun <- function(j) {
+    o <- sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, rb_only = TRUE, z = j$z, win = j$win, trim = j$trim)
+    o[, `:=`(variant = j$variant, litig = j$litig, rep = j$rep)]; o }
+  cat("Sensitivity runs:", nrow(jobs), "databases\n")
+  fwrite(run_parallel(jobs, fun), "step04_sens_raw.csv", bom = TRUE)
+} else cat("step04 sensitivity outputs found -> skipped\n")
+
+# ---- 04.3 litigation spread over several categories (simulation) --------
+if (!file.exists("step04_spread_raw.csv")) {
+  jobs <- rbind(base_jobs[litig %in% c("burst", "sustained")][, n_spread := 3],
+                base_jobs[litig %in% c("burst", "sustained")][, n_spread := 5])   # 2 shocks x 2 spreads x 500
+  fun <- function(j) {
+    o <- sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, n_spread = j$n_spread)
+    o[, `:=`(n_spread = j$n_spread, litig = j$litig, rep = j$rep)]; o }
+  cat("Spread runs:", nrow(jobs), "databases\n")
+  fwrite(run_parallel(jobs, fun), "step04_spread_raw.csv", bom = TRUE)
+} else cat("step04 spread outputs found -> skipped\n")
+
+# ---- 04.4 observed data: tuning sensitivity, litigation definitions, deaths
+rc4 <- fread("step01_reports_clean.csv", encoding = "UTF-8", colClasses = "character")
+rc4 <- rc4[as.IDate(recv) >= as.IDate("2004-01-01")]                   # same window as step02
+rc4[, t := (as.integer(substr(ym, 1, 4)) - 2004) * 12 + as.integer(substr(ym, 6, 7))]
+rc4[, `:=`(def_main = litig_flag == "TRUE", def_talc = category == "powder_talc", def_cancer = cancer_rx == "TRUE")]
+long4 <- rc4[, .(ev = unlist(strsplit(event_groups, "|", fixed = TRUE))),
+             by = .(report_number, cat = category, k = channel, r = regime, t, def_main, def_talc, def_cancer)]
+cnt4 <- long4[, .(n = .N), by = .(cat, ev, k, r, t, def_main, def_talc, def_cancer)]
+cats4 <- sort(unique(cnt4$cat)); evs4 <- sort(unique(cnt4$ev))
+am4 <- list(pre = seq(min(cnt4[r == "pre", t]), max(cnt4[r == "pre", t])),
+            post = seq(min(cnt4[r == "post", t]), max(cnt4[r == "post", t])))
+sig4 <- fread("step02_real_signals.csv")
+pr4 <- CJ(cat = cats4, ev = evs4, sorted = FALSE)
+idx4 <- cbind(match(pr4$cat, cats4), match(pr4$ev, evs4))
+key_main <- sig4[f_rb == TRUE, paste(cat, ev)]
+
+# (a) RB signals in the observed data under each tuning variant
+real_sens <- rbindlist(lapply(seq_len(nrow(variants) + 1), function(i) {
+  v <- if (i == 1) data.table(variant = "Main (13 months, z = 3, 30%)", win = 13, z = 3, trim = .3) else variants[i - 1]
+  rr <- run_methods(cnt4[, .(cat, ev, k, r, t, n)], cats4, evs4, am4, z = v$z, win = v$win, trim = v$trim, rb_only = TRUE)
+  key <- paste(pr4$cat, pr4$ev)[rr$rb$f[idx4]]
+  data.table(variant = v$variant, rb_signals = length(key), also_in_main = sum(key %in% key_main),
+             main_lost = sum(!key_main %in% key), new = sum(!key %in% key_main))
+}))
+print(real_sens)
+
+# (b) alternative litigation-type definitions: do crude-ROR signals survive removal?
+defs <- c(main = "def_main", talc_only = "def_talc", cancer_only = "def_cancer")
+lit_sens <- rbindlist(lapply(names(defs), function(d) {
+  dv <- defs[[d]]
+  orc <- crude_methods(mat_of(cnt4[get(dv) == FALSE, .(cat, ev, n)], cats4, evs4))
+  still <- orc$f_ror[idx4]
+  s <- copy(sig4)[, still := still[match(paste(cat, ev), paste(pr4$cat, pr4$ev))]]
+  data.table(definition = d, reports_removed = sum(rc4[[dv]]), pct_removed = round(100 * mean(rc4[[dv]]), 1),
+             n_ror_only = s[f_ror & !f_rb, .N], pct_ror_only_still_sig = round(100 * s[f_ror & !f_rb, mean(still)], 1),
+             n_both = s[f_ror & f_rb, .N], pct_both_still_sig = round(100 * s[f_ror & f_rb, mean(still)], 1),
+             n_rb_only = s[!f_ror & f_rb, .N], n_sig_after_removal = sum(still))
+}))
+print(lit_sens)
+
+# (c) deaths: outcome field "death" vs the "death" event group, by litigation type
+dth <- rc4[, .(reports = .N, death_outcome = sum(death == "TRUE"),
+               death_outcome_litig = sum(death == "TRUE" & def_main),
+               death_outcome_talc = sum(death == "TRUE" & def_talc),
+               death_outcome_cancer = sum(death == "TRUE" & def_cancer),
+               death_event_group = sum(grepl("(^|\\|)death($|\\|)", event_groups))), by = .(channel, regime)]
+dth <- rbind(dth, rc4[, .(channel = "All", regime = "All", reports = .N, death_outcome = sum(death == "TRUE"),
+                          death_outcome_litig = sum(death == "TRUE" & def_main),
+                          death_outcome_talc = sum(death == "TRUE" & def_talc),
+                          death_outcome_cancer = sum(death == "TRUE" & def_cancer),
+                          death_event_group = sum(grepl("(^|\\|)death($|\\|)", event_groups)))])
+dth[, pct_death_litig := round(100 * death_outcome_litig / pmax(death_outcome, 1), 1)]
+print(dth)
+
+# ---- 04.5 summaries, Figure S3, supplementary tables ----------------------
+base_rb <- mc_raw[M_reg == 5 & comp_shift == FALSE & method == "rb", .(variant = "Main (13 months, z = 3, 30%)",
+                                                                      litig, rep, power, fpr, lit_flag, auc)]
+sens <- rbind(base_rb, fread("step04_sens_raw.csv")[, .(variant, litig, rep, power, fpr, lit_flag, auc)])
+s4 <- sens[, .(fpr = round(mean(fpr), 4), fpr_mcse = round(sd(fpr) / sqrt(.N), 4),
+               power = round(mean(power), 3), power_mcse = round(sd(power) / sqrt(.N), 4),
+               auc = round(mean(auc), 3), shocked_pair_flag = round(mean(lit_flag), 3), n_datasets = .N),
+           by = .(variant, scenario = litig)]
+s4[, scenario := litig_lab[scenario]]
+s4 <- merge(s4, real_sens[, .(variant, real_rb_signals = rb_signals, real_main_lost = main_lost, real_new = new)],
+            by = "variant", all.x = TRUE)
+vord <- c("Main (13 months, z = 3, 30%)", variants$variant)
+s4 <- s4[order(match(variant, vord), match(scenario, litig_lab))]
+fwrite(s4, "step04_tableS4_sensitivity.csv", bom = TRUE)
+
+spr <- rbind(mc_raw[M_reg == 5 & comp_shift == FALSE & litig %in% c("burst", "sustained") &
+                      method %in% c("prr", "ror", "ic", "mh", "sub", "rb", "oracle"),
+                    .(n_spread = 1, litig, method, rep, power, fpr, lit_flag, auc)],
+             fread("step04_spread_raw.csv")[, .(n_spread, litig, method, rep, power, fpr, lit_flag, auc)])
+s5 <- spr[, .(fpr = round(mean(fpr), 4), fpr_mcse = round(sd(fpr) / sqrt(.N), 4),
+              power = round(mean(power), 3), power_mcse = round(sd(power) / sqrt(.N), 4),
+              auc = round(mean(auc), 3), shocked_pairs_flag = round(mean(lit_flag), 3), n_datasets = .N),
+          by = .(scenario = litig, categories_shocked = n_spread, method)]
+s5[, scenario := litig_lab[scenario]]
+s5 <- s5[order(scenario, categories_shocked, match(method, c("prr", "ror", "ic", "mh", "sub", "rb", "oracle")))]
+s5[, method := meth_lab[method]]
+fwrite(s5, "step04_tableS5_spread.csv", bom = TRUE)
+
+s6 <- merge(lit_sens, data.table(definition = names(defs)), by = "definition")
+fwrite(s6, "step04_tableS6_litigation_definitions.csv", bom = TRUE)
+fwrite(dth, "step04_deaths_by_litigation.csv", bom = TRUE)
+
+# Figure S3: RB false-positive rate and power under alternative tuning constants
+fs3d <- rbind(s4[, .(variant, scenario, metric = "False-positive rate", value = fpr)],
+              s4[, .(variant, scenario, metric = "Power", value = power)])
+fs3d[, variant := factor(variant, rev(vord))]
+fs3d[, scenario := factor(scenario, litig_lab)]
+fs3d[, metric := factor(metric, c("False-positive rate", "Power"))]
+fs3d[, main := variant == vord[1]]
+bg3 <- data.table(metric = factor(c("False-positive rate", "Power"), levels(fs3d$metric)), fill = c("white", "grey93"))
+hl3 <- data.table(metric = factor("False-positive rate", levels(fs3d$metric)), x = 0.05)
+fs3 <- ggplot(fs3d, aes(value, variant, colour = main)) +
+  geom_rect(data = bg3, aes(xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf, fill = fill),
+            inherit.aes = FALSE, alpha = 0.6, show.legend = FALSE) +
+  scale_fill_identity() +
+  geom_vline(data = hl3, aes(xintercept = x), linetype = "dotted", linewidth = 0.3) +
+  geom_point(size = 1.6) +
+  facet_grid(scenario ~ metric, scales = "free_x") +
+  scale_colour_manual(values = c(`TRUE` = okabe[7], `FALSE` = okabe[1]), guide = "none") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = NULL, y = NULL) + theme_pap
+save_fig(fs3, "step04_figS3_sensitivity", 7, 7)
+
+cat("\nstep04 finished.\n")
+
+# ======================================================================
+# STEP 05 : additional robustness analyses
+#   05.1 report-level bootstrap of the observed data (500 resamples)
+#   05.2 one event group per report (observed data)
+#   05.3 Hartung-Knapp pooling (simulation + observed data)
+#   05.4 Benjamini-Hochberg FDR (observed data)
+#   05.5 overdispersed multi-event simulation (500 replications)
+#   05.6 classification validation sample (200 reports)
+#   05.7 supplementary tables S7-S10
+# Same 500 replications and seeds as the main Monte Carlo.
+# ======================================================================
+cat("\n--- step05 ---\n")
+B_rep <- R_rep                                                         # 500 bootstrap resamples = 500 replications
+
+# ---- 05.0 report-level long table of the observed data (from step04) ----
+long5 <- copy(long4)[, rid := match(report_number, unique(report_number))]   # integer report id
+n_rep5 <- uniqueN(long5$rid)
+key5 <- paste(pr4$cat, pr4$ev)                                          # pair labels in matrix order (idx4)
+main5 <- run_methods(cnt4[, .(cat, ev, k, r, t, n)], cats4, evs4, am4)  # main analysis re-run (checks identity)
+cat("RB signals in re-run:", sum(main5$rb$f), "(step02:", sum(sig4$f_rb), ")\n")
+
+# ---- 05.1 report-level bootstrap -------------------------------------------
+# Each resample draws reports with replacement, so all event groups of a report stay together;
+# this captures the dependence between cells and the extra variance of the weighted counts.
+if (!file.exists("step05_bootstrap_raw.csv") || !file.exists("step05_rules_v4.txt")) {   # re-run once with rules v4
+  jobs <- data.table(b = seq_len(B_rep), seed = 20261119 + seq_len(B_rep))
+  fun <- function(j) {
+    set.seed(j$seed)
+    w <- tabulate(sample.int(n_rep5, n_rep5, replace = TRUE), n_rep5)  # how often each report is drawn
+    cb <- long5[w[rid] > 0, .(n = sum(w[rid])), by = .(cat, ev, k, r, t)]
+    rr <- run_methods(cb, cats4, evs4, am4)
+    data.table(b = j$b, pair = key5, f_rb = rr$rb$f[idx4], rb_mu = rr$rb$mu[idx4],
+               f_ror = rr$cr$f_ror[idx4], ror_lor = rr$cr$lor[idx4])
+  }
+  cat("Bootstrap:", B_rep, "resamples\n")
+  fwrite(run_parallel(jobs, fun, extra = c("long5", "n_rep5", "cats4", "evs4", "am4", "idx4", "key5")),
+         "step05_bootstrap_raw.csv", bom = TRUE)
+  writeLines("rules v4", "step05_rules_v4.txt")                        # marker: bootstrap done with rules v4
+} else cat("step05 bootstrap outputs found -> skipped\n")
+bt <- fread("step05_bootstrap_raw.csv")
+s7 <- bt[, .(rb_stability = mean(f_rb), ror_stability = mean(f_ror),
+             rb_se_boot = sd(rb_mu, na.rm = TRUE), ror_se_boot = sd(ror_lor, na.rm = TRUE)), by = pair]
+cr_se <- (main5$cr$lor - main5$cr$ror_low) / 1.96                      # analytic SE of the crude log-ROR
+s7 <- merge(data.table(pair = key5, cat = pr4$cat, ev = pr4$ev, f_rb = main5$rb$f[idx4], f_ror = main5$cr$f_ror[idx4],
+                       rb_mu = main5$rb$mu[idx4], rb_se = main5$rb$se[idx4], rb_A = main5$rb$A[idx4],
+                       ror_se = cr_se[idx4]), s7, by = "pair")
+s7[, se_ratio := rb_se_boot / rb_se]                                    # >1: analytic RB SE too small
+s7[, ror_se_ratio := ror_se_boot / ror_se]                              # >1: analytic crude-ROR SE too small
+s7[, f_rb_boot := !is.na(rb_mu) & rb_mu - 1.96 * pmax(rb_se, rb_se_boot, na.rm = TRUE) > 0 & rb_A >= 3]   # SE = max(analytic, bootstrap)
+boot_sum <- data.table(
+  rb_signals_main = sum(s7$f_rb), rb_signals_bootstrap_se = sum(s7$f_rb_boot),
+  both = sum(s7$f_rb & s7$f_rb_boot),
+  median_se_ratio_rb_signals = round(median(s7[f_rb == TRUE, se_ratio], na.rm = TRUE), 3),
+  iqr_se_ratio_rb_signals = paste(round(quantile(s7[f_rb == TRUE, se_ratio], c(.25, .75), na.rm = TRUE), 3), collapse = "-"),
+  rb_signals_stable_80 = sum(s7$f_rb & s7$rb_stability >= 0.8),
+  median_stability_rb_signals = round(median(s7[f_rb == TRUE, rb_stability]), 3),
+  ror_signals_main = sum(s7$f_ror), ror_signals_stable_80 = sum(s7$f_ror & s7$ror_stability >= 0.8),
+  median_se_ratio_ror_all = round(median(s7$ror_se_ratio, na.rm = TRUE), 3))
+print(boot_sum)
+
+# ---- 05.2 one event group per report ------------------------------------------
+set.seed(20261120)
+one5 <- long5[order(rid, runif(.N))][!duplicated(rid)]                 # one randomly chosen event group per report
+c1 <- one5[, .(n = .N), by = .(cat, ev, k, r, t)]
+r1 <- run_methods(c1, cats4, evs4, am4)
+
+# ---- 05.3 Hartung-Knapp pooling: observed data --------------------------------
+rhk <- run_methods(cnt4[, .(cat, ev, k, r, t, n)], cats4, evs4, am4, rb_only = TRUE, pool_method = "HK")
+
+# ---- 05.4 Benjamini-Hochberg FDR: observed data -------------------------------
+bh_flag <- function(lor, se, a) {                                       # BH at q = 0.05, positive associations only
+  p <- 2 * pnorm(-abs(lor / se)); q <- p.adjust(p, "BH")
+  !is.na(q) & q < 0.05 & lor > 0 & a >= 3
+}
+cr5 <- main5$cr
+f_ror_bh <- bh_flag(cr5$lor, (cr5$lor - cr5$ror_low) / 1.96, cr5$a)
+f_rb_bh  <- bh_flag(main5$rb$mu, main5$rb$se, main5$rb$A)
+
+cmp_row <- function(label, fr, fb) {                                   # fr, fb: logical vectors in pair order (key5)
+  m <- as.vector(main5$rb$f[idx4]); fb[is.na(fb)] <- FALSE
+  data.table(analysis = label, ror_signals = if (is.null(fr)) NA_integer_ else sum(fr, na.rm = TRUE),
+             rb_signals = sum(fb, na.rm = TRUE), rb_also_in_main = sum(fb & m, na.rm = TRUE),
+             rb_main_lost = sum(m & !fb, na.rm = TRUE), rb_new = sum(fb & !m, na.rm = TRUE))
+}
+s9 <- rbind(cmp_row("Main analysis", main5$cr$f_ror[idx4], main5$rb$f[idx4]),
+            cmp_row("One event group per report", r1$cr$f_ror[idx4], r1$rb$f[idx4]),
+            cmp_row("Hartung-Knapp pooling", NULL, rhk$rb$f[idx4]),
+            cmp_row("Benjamini-Hochberg FDR 5%", f_ror_bh[idx4], f_rb_bh[idx4]),
+            cmp_row("RB with bootstrap SE (500 resamples)", NULL, s7$f_rb_boot[match(key5, s7$pair)]))
+s9 <- s9[, ror_signals := as.integer(ror_signals)]
+print(s9)
+
+# ---- 05.5 simulation: Hartung-Knapp and overdispersed multi-event data -------
+# sim_real: category-month totals are negative binomial (gamma frailty, size theta), events split multinomially;
+# 39% of reports carry a second event group (mean 1.39 groups per report), as in the observed data.
+sim_real <- function(M_reg, litig, seed, theta = 2, p2 = 0.39, C = 15, E = 12, Tm = 120, Tpre = 96, n_sig = 18) {
+  set.seed(seed)
+  norm <- function(x) x / sum(x)
+  piD <- norm(rgamma(C, 1.5)); piI <- norm(piD * exp(rnorm(C, 0, .5)))
+  phiD <- norm(rgamma(E, 1.5)); phiI <- norm(phiD * exp(rnorm(E, 0, .7)))
+  RR <- matrix(1, C, E); cand <- setdiff(seq_len(C * E), 1)
+  sig <- sample(cand, n_sig); RR[sig] <- sample(c(1.5, 2, 3), n_sig, replace = TRUE)
+  Pk <- function(phi) { X <- sweep(RR, 2, phi, "*"); X / rowSums(X) }
+  PD <- Pk(phiD); PI <- Pk(phiI)
+  cats <- sprintf("c%02d", seq_len(C)); evs <- sprintf("e%02d", seq_len(E))
+  mk <- function(k, r, tt, lam, pic, P) {                               # one stratum: reports -> event-group counts
+    tot <- matrix(rnbinom(C * length(tt), size = theta, mu = rep(lam * pic, length(tt))), C)   # C x months
+    sec <- matrix(rbinom(length(tot), tot, p2), C)                       # reports with a second event group
+    out <- vector("list", length(tt))
+    for (j in seq_along(tt)) {
+      cnt <- matrix(0, C, E)
+      for (c in which(tot[, j] > 0)) {
+        cnt[c, ] <- rmultinom(1, tot[c, j], P[c, ])[, 1] + if (sec[c, j] > 0) rmultinom(1, sec[c, j], P[c, ])[, 1] else 0
+      }
+      nz <- which(cnt > 0)
+      if (!length(nz)) next                                              # month without reports
+      out[[j]] <- data.table(cat = cats[(nz - 1) %% C + 1], ev = evs[(nz - 1) %/% C + 1], k = k, r = r, t = tt[j], n = cnt[nz], litig = FALSE)
+    }
+    rbindlist(out)
+  }
+  pre <- seq_len(Tpre); post <- (Tpre + 1):Tm
+  cnt <- rbind(mk("Direct", "pre", pre, 60, piD, PD), mk("Direct", "post", post, 30, piD, PD),
+               mk("Industry", "pre", pre, 8, piI, PI), mk("Industry", "post", post, 8 * M_reg, piI, PI))
+  shock <- function(tt, lam, k) data.table(cat = "c01", ev = "e01", k = k, r = ifelse(tt <= Tpre, "pre", "post"), t = tt,
+                                          n = rnbinom(length(tt), size = theta, mu = lam), litig = TRUE)
+  if (litig == "burst")     cnt <- rbind(cnt, shock(70:75, 2500, "Industry"))
+  if (litig == "notoriety") cnt <- rbind(cnt, shock(70:75, 250, "Direct"))
+  if (litig == "sustained") cnt <- rbind(cnt, shock(40:Tm, 250, "Industry"))
+  cnt <- cnt[, .(n = sum(n)), by = .(cat, ev, k, r, t, litig)]
+  am <- list(pre = pre, post = post)
+  res <- run_methods(cnt, cats, evs, am)
+  orc <- crude_methods(mat_of(cnt[litig == FALSE], cats, evs))
+  truth <- as.vector(RR > 1); isshock <- seq_len(C * E) == 1
+  stat <- list(prr = log(pmax(res$cr$prr, 1e-9)), ror = res$cr$ror_low, ic = res$cr$ic025, mh = res$mh$low,
+               sub = res$sg_low, rb = res$rb$low, oracle = orc$ror_low)
+  flag <- list(prr = res$cr$f_prr, ror = res$cr$f_ror, ic = res$cr$f_ic, mh = res$mh$f, sub = res$sg_f,
+               rb = res$rb$f, oracle = orc$f_ror)
+  auc <- function(s) { s <- as.vector(s); s[!is.finite(s)] <- -1e6; s <- s[!isshock]; y <- truth[!isshock]
+    rk <- rank(s); n1 <- sum(y); n0 <- sum(!y); (sum(rk[y]) - n1 * (n1 + 1) / 2) / (n1 * n0) }
+  rbindlist(lapply(names(flag), function(m) {
+    f <- as.vector(flag[[m]]); f[is.na(f)] <- FALSE
+    data.table(method = m, power = mean(f[truth]), fpr = mean(f[!truth & !isshock]), lit_flag = mean(f[isshock]), auc = auc(stat[[m]]))
+  }))
+}
+sim_hk <- function(j) {                                                # RB with Hartung-Knapp pooling, same databases as main
+  o <- sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, rb_only = TRUE, pool_method = "HK")
+  o[, `:=`(litig = j$litig, rep = j$rep)]; o
+}
+if (!file.exists("step05_hk_sim_raw.csv")) {
+  jobs <- base_jobs
+  cat("Hartung-Knapp simulation:", nrow(jobs), "databases\n")
+  fwrite(run_parallel(jobs, sim_hk, extra = c("sim_hk")), "step05_hk_sim_raw.csv", bom = TRUE)
+} else cat("step05 Hartung-Knapp outputs found -> skipped\n")
+if (!file.exists("step05_realsim_raw.csv")) {
+  jobs <- base_jobs
+  fun <- function(j) { o <- sim_real(j$M_reg, j$litig, j$seed); o[, `:=`(litig = j$litig, rep = j$rep)]; o }
+  cat("Overdispersed multi-event simulation:", nrow(jobs), "databases\n")
+  fwrite(run_parallel(jobs, fun, extra = c("sim_real")), "step05_realsim_raw.csv", bom = TRUE)
+} else cat("step05 overdispersed simulation outputs found -> skipped\n")
+
+# ---- 05.6 classification validation sample ------------------------------------
+if (!file.exists("step05_validation_sample.csv")) {
+  set.seed(20261121)
+  vs <- rc4[, .SD[sample.int(.N, min(.N, 12))], by = category]          # up to 12 reports per category
+  vs <- rbind(vs, rc4[!report_number %in% vs$report_number][sample.int(.N, 200 - nrow(vs))])   # top up to 200 at random
+  fwrite(vs[, .(report_number, channel, regime, category, suspect_products = clean_utf8(suspect_products),
+                event_groups, reactions = clean_utf8(reactions))][order(category)],
+         "step05_validation_sample.csv", bom = TRUE)
+}
+
+# ---- 05.7 supplementary tables ------------------------------------------------
+summ_mc <- function(d) d[, .(fpr = round(mean(fpr), 4), fpr_mcse = round(sd(fpr) / sqrt(.N), 4),
+                             power = round(mean(power), 3), power_mcse = round(sd(power) / sqrt(.N), 4),
+                             auc = round(mean(auc), 3), shocked_pair_flag = round(mean(lit_flag), 3), n_datasets = .N),
+                         by = .(scenario = litig, method)]
+s8 <- summ_mc(fread("step05_realsim_raw.csv"))
+s8[, scenario := factor(scenario, names(litig_lab))][, method := factor(method, main_m)]
+s8 <- s8[order(scenario, method)][, `:=`(scenario = litig_lab[as.character(scenario)], method = meth_lab[as.character(method)])]
+fwrite(s8, "step05_tableS8_overdispersed_simulation.csv", bom = TRUE)
+
+s10 <- rbind(summ_mc(mc_raw[M_reg == 5 & comp_shift == FALSE & method == "rb", .(litig, method = "DerSimonian-Laird", fpr, power, auc, lit_flag)]),
+             summ_mc(fread("step05_hk_sim_raw.csv")[, .(litig, method = "Hartung-Knapp", fpr, power, auc, lit_flag)]))
+s10[, scenario := litig_lab[scenario]]
+fwrite(s10[order(match(scenario, litig_lab), method)], "step05_tableS10_hartung_knapp.csv", bom = TRUE)
+
+fwrite(s7[order(-f_rb, -rb_stability), .(cat, ev, rb_signal = f_rb, rb_signal_bootstrap_ci = f_rb_boot,
+                                          rb_stability = round(rb_stability, 3), ror_signal = f_ror, ror_stability = round(ror_stability, 3),
+                                          rb_log_ror = round(rb_mu, 3), rb_se_analytic = round(rb_se, 3),
+                                          rb_se_bootstrap = round(rb_se_boot, 3), se_ratio = round(se_ratio, 3),
+                                          ror_se_ratio = round(ror_se_ratio, 3))],
+       "step05_tableS7_bootstrap_pairs.csv", bom = TRUE)
+fwrite(boot_sum, "step05_bootstrap_summary.csv", bom = TRUE)
+fwrite(s9, "step05_tableS9_observed_sensitivity.csv", bom = TRUE)
+print(s8); print(s10)
+cat("\nstep05 finished.\n")
+
+# ======================================================================
+# STEP 06 : product-name strings and preferred terms for rule revision
+#   step06_product_strings.csv : suspect-product string, assigned category, n
+#                                (all "other" strings; top 300 per other category)
+#   step06_pt_counts.csv       : MedDRA preferred term, event group, n
+# ======================================================================
+cat("\n--- step06 ---\n")
+rc6 <- fread("step01_reports_clean.csv", encoding = "UTF-8", colClasses = "character")
+rc6 <- rc6[as.IDate(recv) >= as.IDate("2004-01-01")]                   # analysis window
+ps <- rc6[, .(n = .N), by = .(category, suspect_products = clean_utf8(suspect_products))]   # one row per string
+ps <- ps[order(category, -n)]
+ps_out <- rbind(ps[category == "other"],                                # every string left in "other"
+                ps[category != "other", head(.SD, 300), by = category]) # most frequent strings elsewhere
+fwrite(ps_out, "step06_product_strings.csv", bom = TRUE)
+pt <- rc6[, .(pt = unlist(strsplit(clean_utf8(reactions), "|", fixed = TRUE))), by = report_number]   # one row per term
+pt <- pt[, .(n = .N), by = pt][, event_group := assign_ev(pt)][order(event_group, -n)]
+fwrite(pt, "step06_pt_counts.csv", bom = TRUE)
+cat("strings:", nrow(ps_out), "| terms:", nrow(pt), "\n")
+cat("\nstep06 finished.\n")
+
+# ======================================================================
+# STEP 07 : rules v3 - independent validation sample (200 reports)
+#   drawn after the rules were fixed, excluding the 200 reports of step05
+# ======================================================================
+cat("\n--- step07 ---\n")
+if (!file.exists("step07_validation_sample_v3.csv")) {
+  rc7 <- fread("step01_reports_clean.csv", encoding = "UTF-8", colClasses = "character")
+  rc7 <- rc7[as.IDate(recv) >= as.IDate("2004-01-01")]                 # analysis window
+  used <- if (file.exists("step05_validation_sample.csv")) fread("step05_validation_sample.csv", colClasses = "character")$report_number else character()
+  rc7 <- rc7[!report_number %in% used]                                  # new reports only
+  set.seed(20261122)
+  vs7 <- rc7[, .SD[sample.int(.N, min(.N, 12))], by = category]         # up to 12 per category
+  vs7 <- rbind(vs7, rc7[!report_number %in% vs7$report_number][sample.int(.N, max(0, min(.N, 200 - nrow(vs7))))])   # top up to 200
+  fwrite(vs7[, .(report_number, channel, regime, category, suspect_products = clean_utf8(suspect_products),
+                 event_groups, reactions = clean_utf8(reactions))][order(category)],
+         "step07_validation_sample_v3.csv", bom = TRUE)
+}
+cat("\nstep07 finished.\n")
+
+# ======================================================================
+# STEP 08 : final rules v4 - validation sample of 200 reports
+#   stratified by final category, excluding the reports of the earlier samples
+# ======================================================================
+cat("\n--- step08 ---\n")
+if (!file.exists("step08_validation_sample_v4.csv")) {
+  rc8 <- fread("step01_reports_clean.csv", encoding = "UTF-8", colClasses = "character")
+  rc8 <- rc8[as.IDate(recv) >= as.IDate("2004-01-01")]                 # analysis window
+  used <- unlist(lapply(c("step05_validation_sample.csv", "step07_validation_sample_v3.csv"), function(f)
+    if (file.exists(f)) fread(f, colClasses = "character")$report_number else character()))
+  rc8 <- rc8[!report_number %in% used]                                  # reports not checked before
+  set.seed(20261123)
+  vs8 <- rc8[, .SD[sample.int(.N, min(.N, 12))], by = category]         # up to 12 per category
+  vs8 <- rbind(vs8, rc8[!report_number %in% vs8$report_number][sample.int(.N, max(0, min(.N, 200 - nrow(vs8))))])   # top up to 200
+  fwrite(vs8[, .(report_number, channel, regime, category, suspect_products = clean_utf8(suspect_products),
+                 event_groups, reactions = clean_utf8(reactions))][order(category)],
+         "step08_validation_sample_v4.csv", bom = TRUE)
+}
+cat("\nstep08 finished.\n")
+
+# ======================================================================
+# STEP 09 : additional robustness analyses
+#   09.1 probable duplicate reports: identical suspect products, receipt
+#        date, age, age unit, sex and preferred terms (observed data)
+#   09.2 selective shock: two true signals placed in the shocked category
+#        (simulation, regime multiplier 5, 4 shocks x 500 replications,
+#        same seeds as the main Monte Carlo)
+#   09.3 non-litigation monthly means: whole voluntary period, 2019-2023,
+#        mandatory period
+# Uses objects of step04/05 (rc4, long4, cats4, evs4, am4, idx4, main5,
+# cmp_row, base_jobs, run_parallel). Nothing is overwritten.
+# ======================================================================
+cat("\n--- step09 ---\n")
+
+# ---- 09.1 probable duplicate reports ----------------------------------------
+dup_key <- c("suspect_products", "recv", "age", "age_unit", "gender", "reactions")   # fields that must all match
+rc9 <- copy(rc4)[order(as.numeric(report_number))]                     # keep the lowest report number of each set
+for (v in dup_key) set(rc9, which(is.na(rc9[[v]])), v, "")             # NA and empty text treated alike
+dup_ok <- tryCatch({                                                   # Option A: data.table duplicated()
+  rc9[, dup_all := duplicated(rc9, by = dup_key)]; TRUE
+}, error = function(e) { cat("Option A (duplicated) failed:", conditionMessage(e), "\n"); FALSE })
+if (!dup_ok) rc9[, dup_all := duplicated(as.data.frame(rc9)[, dup_key])]   # Option B: base R duplicated()
+rc9[, dup_age := dup_all & age != ""]                                   # stricter: only sets with age recorded
+
+dup_defs <- c("Probable duplicates removed (all fields identical)" = "dup_all",
+              "Probable duplicates removed (age recorded)" = "dup_age")
+dup_tab <- rbindlist(lapply(names(dup_defs), function(lb) {
+  dv <- dup_defs[[lb]]
+  drop <- rc9[get(dv) == TRUE, report_number]                          # reports treated as duplicates
+  cnt9 <- long4[!report_number %in% drop, .(n = .N), by = .(cat, ev, k, r, t)]   # counts without them
+  rr <- run_methods(cnt9, cats4, evs4, am4)                             # all methods, main settings
+  cbind(cmp_row(lb, rr$cr$f_ror[idx4], rr$rb$f[idx4]),
+        data.table(reports_removed = length(drop),
+                   pct_removed = round(100 * length(drop) / nrow(rc9), 1),
+                   pct_litig_among_removed = round(100 * rc9[get(dv) == TRUE, mean(def_main)], 1),
+                   non_litig_removed = rc9[get(dv) == TRUE & !def_main, .N],
+                   industry_removed = rc9[get(dv) == TRUE & channel == "Industry", .N]))
+}))
+dup_tab <- rbind(cbind(cmp_row("Main analysis", main5$cr$f_ror[idx4], main5$rb$f[idx4]),
+                       data.table(reports_removed = 0L, pct_removed = 0, pct_litig_among_removed = NA_real_,
+                                  non_litig_removed = 0L, industry_removed = 0L)), dup_tab)
+print(dup_tab)
+fwrite(dup_tab, "step09_duplicate_sensitivity.csv", bom = TRUE)
+
+# ---- 09.2 selective shock: true signals inside the shocked category -----------
+# Same generator as sim_ext (n_spread = 1); the only change is that two of the 18 true
+# signals are placed in category c01 (events e02, e03), the category carrying the shock (c01, e01).
+sim_sel <- function(M_reg, litig, comp_shift, seed, n_in = 2, C = 15, E = 12, Tm = 120, Tpre = 96, n_sig = 18) {
+  set.seed(seed)
+  norm <- function(x) x / sum(x)
+  piD <- norm(rgamma(C, 1.5)); piIpre <- norm(piD * exp(rnorm(C, 0, .5)))
+  piIpost <- if (comp_shift) norm(piIpre * exp(rnorm(C, 0, 1))) else piIpre
+  phiD <- norm(rgamma(E, 1.5)); phiI <- norm(phiD * exp(rnorm(E, 0, .7)))
+  shocked <- 1L                                                         # pair (c01, e01), never a true signal
+  forced <- 1L + C * seq_len(n_in)                                      # pairs (c01, e02), (c01, e03)
+  RR <- matrix(1, C, E); cand <- setdiff(seq_len(C * E), c(shocked, forced))
+  sig <- c(forced, sample(cand, n_sig - n_in)); RR[sig] <- sample(c(1.5, 2, 3), n_sig, replace = TRUE)
+  Pk <- function(phi) { X <- sweep(RR, 2, phi, "*"); X / rowSums(X) }
+  PD <- Pk(phiD); PI <- Pk(phiI)
+  cats <- sprintf("c%02d", seq_len(C)); evs <- sprintf("e%02d", seq_len(E))
+  mk <- function(k, r, tt, lam, pic, P) {                               # Poisson counts for one stratum
+    mu <- as.vector(lam * pic * P)
+    n <- rpois(length(mu) * length(tt), rep(mu, length(tt)))
+    data.table(cat = rep(rep(cats, E), length(tt)), ev = rep(rep(evs, each = C), length(tt)),
+               k = k, r = r, t = rep(tt, each = C * E), n = n, litig = FALSE)[n > 0]
+  }
+  pre <- seq_len(Tpre); post <- (Tpre + 1):Tm
+  cnt <- rbind(mk("Direct", "pre", pre, 60, piD, PD), mk("Direct", "post", post, 30, piD, PD),
+               mk("Industry", "pre", pre, 8, piIpre, PI), mk("Industry", "post", post, 8 * M_reg, piIpost, PI))
+  shock <- function(tt, lam, k) data.table(cat = "c01", ev = "e01", k = k, r = ifelse(tt <= Tpre, "pre", "post"),
+                                           t = tt, n = rpois(length(tt), lam), litig = TRUE)
+  if (litig == "burst")     cnt <- rbind(cnt, shock(70:75, 2500, "Industry"))
+  if (litig == "notoriety") cnt <- rbind(cnt, shock(70:75, 250, "Direct"))
+  if (litig == "sustained") cnt <- rbind(cnt, shock(40:Tm, 250, "Industry"))
+  cnt <- cnt[, .(n = sum(n)), by = .(cat, ev, k, r, t, litig)]
+  truth <- as.vector(RR > 1); isshock <- seq_len(C * E) %in% shocked; isin <- seq_len(C * E) %in% forced
+  res <- run_methods(cnt, cats, evs, list(pre = pre, post = post))
+  orc <- crude_methods(mat_of(cnt[litig == FALSE], cats, evs))
+  flag <- list(prr = res$cr$f_prr, ror = res$cr$f_ror, ic = res$cr$f_ic, mh = res$mh$f, sub = res$sg_f,
+               rb = res$rb$f, oracle = orc$f_ror)
+  rbindlist(lapply(names(flag), function(m) {
+    f <- as.vector(flag[[m]]); f[is.na(f)] <- FALSE
+    data.table(method = m, power_in_shocked_cat = mean(f[isin]), power_other = mean(f[truth & !isin]),
+               fpr = mean(f[!truth & !isshock]), lit_flag = mean(f[isshock]))
+  }))
+}
+if (!file.exists("step09_selective_raw.csv")) {
+  jobs <- copy(base_jobs)                                               # 4 shocks x 500, M = 5, no composition shift
+  fun <- function(j) { o <- sim_sel(j$M_reg, j$litig, j$comp_shift, j$seed); o[, `:=`(litig = j$litig, rep = j$rep)]; o }
+  cat("Selective-shock simulation:", nrow(jobs), "databases\n")
+  fwrite(run_parallel(jobs, fun, extra = "sim_sel"), "step09_selective_raw.csv", bom = TRUE)
+} else cat("step09 selective-shock outputs found -> skipped\n")
+sel <- fread("step09_selective_raw.csv")
+sel_sum <- sel[, .(power_in_shocked_cat = round(mean(power_in_shocked_cat), 3),
+                   power_in_mcse = round(sd(power_in_shocked_cat) / sqrt(.N), 4),
+                   power_other = round(mean(power_other), 3),
+                   fpr = round(mean(fpr), 4), fpr_mcse = round(sd(fpr) / sqrt(.N), 4),
+                   shocked_pair_flag = round(mean(lit_flag), 3), n_datasets = .N), by = .(scenario = litig, method)]
+sel_sum <- sel_sum[order(match(scenario, c("none", "burst", "sustained", "notoriety")),
+                         match(method, c("prr", "ror", "ic", "mh", "sub", "rb", "oracle")))]
+print(sel_sum)
+fwrite(sel_sum, "step09_selective_shock_summary.csv", bom = TRUE)
+
+# ---- 09.3 non-litigation monthly means over alternative periods ---------------
+nl9 <- rc4[def_main == FALSE]                                           # reports outside the litigation-type flag
+nl9[, d := as.IDate(recv)]
+per <- data.table(period = c("Voluntary 2004-2023 (240 months)", "Voluntary 2019-2023 (60 months)",
+                             "Mandatory Jan 2024-Aug 2025 (20 months)"),
+                  from = as.IDate(c("2004-01-01", "2019-01-01", "2024-01-01")),
+                  to = as.IDate(c("2023-12-28", "2023-12-28", "2025-08-31")), months = c(240, 60, 20))
+mm <- rbindlist(lapply(seq_len(nrow(per)), function(i) nl9[d >= per$from[i] & d <= per$to[i],
+        .(period = per$period[i], reports = .N, per_month = round(.N / per$months[i], 1)), by = channel]))
+mm <- dcast(mm, period ~ channel, value.var = c("reports", "per_month"))
+mm <- mm[match(per$period, period)]
+print(mm)
+fwrite(mm, "step09_nonlitigation_monthly.csv", bom = TRUE)
+cat("\nstep09 finished.\n")
+
+# ======================================================================
+# STEP 10 : additional robustness analyses
+#   10.1 simulation: RB with Paule-Mandel pooling and RB with a trailing
+#        baseline (median of the previous 12 months, no future data);
+#        regime multiplier 5, no composition shift, 4 shocks x 500,
+#        same seeds as the main Monte Carlo (paired with DL and HK)
+#   10.2 observed data: number of RB signals under both variants
+#   10.3 table: DL (main), Hartung-Knapp, Paule-Mandel, trailing window
+# Functions changed only by new optional arguments with unchanged
+# defaults (pool_method = "PM", align = "trailing"); the step04
+# reproducibility check confirms that the main results are unchanged.
+# ======================================================================
+cat("\n--- step10 ---\n")
+
+# ---- 10.1 simulation ---------------------------------------------------------
+sim_v10 <- function(j) {                                               # both variants on the same database
+  pm <- sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, rb_only = TRUE, pool_method = "PM")
+  tr <- sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, rb_only = TRUE, align = "trailing")
+  rbind(pm[, variant := "Paule-Mandel pooling"], tr[, variant := "Trailing 12-month baseline"])[,
+        `:=`(litig = j$litig, rep = j$rep)]
+}
+if (!file.exists("step10_sim_raw.csv")) {
+  jobs <- copy(base_jobs)                                               # 4 shocks x 500, M = 5, no composition shift
+  cat("Paule-Mandel and trailing-window simulation:", nrow(jobs), "databases x 2 variants\n")
+  fwrite(run_parallel(jobs, sim_v10, extra = "sim_v10"), "step10_sim_raw.csv", bom = TRUE)
+} else cat("step10 simulation outputs found -> skipped\n")
+
+# ---- 10.2 observed data ------------------------------------------------------
+cn10 <- cnt4[, .(cat, ev, k, r, t, n)]                                  # main observed counts
+r_pm <- run_methods(cn10, cats4, evs4, am4, rb_only = TRUE, pool_method = "PM")
+r_tr <- run_methods(cn10, cats4, evs4, am4, rb_only = TRUE, align = "trailing")
+obs10 <- rbind(cmp_row("Main analysis (DerSimonian-Laird, centred window)", main5$cr$f_ror[idx4], main5$rb$f[idx4]),
+               cmp_row("Paule-Mandel pooling", NULL, r_pm$rb$f[idx4]),
+               cmp_row("Trailing 12-month baseline", NULL, r_tr$rb$f[idx4]))
+obs10[, ror_signals := as.integer(ror_signals)]
+print(obs10)
+fwrite(obs10, "step10_observed_variants.csv", bom = TRUE)
+lost10 <- data.table(pair = key5, main = as.vector(main5$rb$f[idx4]),
+                     pm = as.vector(r_pm$rb$f[idx4]), trailing = as.vector(r_tr$rb$f[idx4]))[main != pm | main != trailing]
+fwrite(lost10, "step10_observed_changed_pairs.csv", bom = TRUE)   # pairs whose RB status changes under a variant
+
+# ---- 10.3 table: four RB variants in the simulation --------------------------
+v10 <- fread("step10_sim_raw.csv")
+tab10 <- rbind(
+  summ_mc(mc_raw[M_reg == 5 & comp_shift == FALSE & method == "rb", .(litig, method = "DerSimonian-Laird, centred (main)", fpr, power, auc, lit_flag)]),
+  summ_mc(fread("step05_hk_sim_raw.csv")[, .(litig, method = "Hartung-Knapp, centred", fpr, power, auc, lit_flag)]),
+  summ_mc(v10[variant == "Paule-Mandel pooling", .(litig, method = "Paule-Mandel, centred", fpr, power, auc, lit_flag)]),
+  summ_mc(v10[variant == "Trailing 12-month baseline", .(litig, method = "DerSimonian-Laird, trailing", fpr, power, auc, lit_flag)]))
+tab10[, scenario := litig_lab[scenario]]
+tab10 <- tab10[order(match(scenario, litig_lab))]
+print(tab10)
+fwrite(tab10, "step10_tableS10_rb_variants.csv", bom = TRUE)
+cat("\nstep10 finished.\n")
+
+# ======================================================================
+# STEP 11 : additional robustness analyses
+#   11.1 observed data: report-level 2x2 tables (a = reports with the event
+#        group, b = reports of the category without it, d = N - a - b - c),
+#        all methods, compared with the main (mention-level) tables
+#   11.2 overdispersed multi-event simulation (same generator and seeds as
+#        step05): mention-level and report-level tables on the same databases
+#   11.3 serious-event enrichment: in the mandatory Industry stratum the four
+#        "serious" event groups are reported 5 times as often (all methods)
+#   11.4 extreme dominance: shocked reports about 85% of the database
+#        (litigation burst x 3, sustained litigation x 2.3; all methods)
+# 4 shocks (11.4: 2 shocks) x 500 replications, regime multiplier 5,
+# no composition shift, same seeds as the main Monte Carlo.
+# New function arguments have defaults that leave earlier results unchanged.
+# ======================================================================
+cat("\n--- step11 ---\n")
+
+# ---- 11.1 observed data, report-level tables ---------------------------------
+rl4 <- rc4[, .(n = .N), by = .(cat = category, k = channel, r = regime, t)]   # reports per category-month-stratum
+r_rl <- run_methods(cnt4[, .(cat, ev, k, r, t, n)], cats4, evs4, am4, rl = rl4)
+obs11 <- rbind(cmp_row("Main analysis (mention-level tables)", main5$cr$f_ror[idx4], main5$rb$f[idx4]),
+               cmp_row("Report-level tables", r_rl$cr$f_ror[idx4], r_rl$rb$f[idx4]))
+obs11[, ror_signals := as.integer(ror_signals)]
+cnt_sig <- function(r) c(prr = sum(r$cr$f_prr), ror = sum(r$cr$f_ror), ic = sum(r$cr$f_ic), mh = sum(r$mh$f, na.rm = TRUE),
+                         sub = sum(r$sg_f), rb = sum(r$rb$f))
+obs11_all <- data.table(method = c("PRR", "ROR", "IC025", "MH-ROR", "Subgroup ROR", "RB"),
+                        mention_level = cnt_sig(main5), report_level = cnt_sig(r_rl))
+print(obs11); print(obs11_all)
+fwrite(obs11, "step11_observed_report_level.csv", bom = TRUE)
+fwrite(obs11_all, "step11_observed_report_level_all_methods.csv", bom = TRUE)
+fwrite(data.table(pair = key5, main = as.vector(main5$rb$f[idx4]), report_level = as.vector(r_rl$rb$f[idx4]),
+                  rb_low_main = round(as.vector(main5$rb$low[idx4]), 3), rb_low_report = round(as.vector(r_rl$rb$low[idx4]), 3))[main != report_level],
+       "step11_observed_rl_changed_pairs.csv", bom = TRUE)
+
+# ---- 11.2 overdispersed simulation, mention- vs report-level tables -----------
+# Same generator and random stream as sim_real (step05); also keeps the number of reports
+# per category-month, so that report-level tables can be built on the same databases.
+sim_real2 <- function(M_reg, litig, seed, theta = 2, p2 = 0.39, C = 15, E = 12, Tm = 120, Tpre = 96, n_sig = 18) {
+  set.seed(seed)
+  norm <- function(x) x / sum(x)
+  piD <- norm(rgamma(C, 1.5)); piI <- norm(piD * exp(rnorm(C, 0, .5)))
+  phiD <- norm(rgamma(E, 1.5)); phiI <- norm(phiD * exp(rnorm(E, 0, .7)))
+  RR <- matrix(1, C, E); cand <- setdiff(seq_len(C * E), 1)
+  sig <- sample(cand, n_sig); RR[sig] <- sample(c(1.5, 2, 3), n_sig, replace = TRUE)
+  Pk <- function(phi) { X <- sweep(RR, 2, phi, "*"); X / rowSums(X) }
+  PD <- Pk(phiD); PI <- Pk(phiI)
+  cats <- sprintf("c%02d", seq_len(C)); evs <- sprintf("e%02d", seq_len(E))
+  rl_all <- list()                                                     # reports per category-month (no random draws)
+  mk <- function(k, r, tt, lam, pic, P) {
+    tot <- matrix(rnbinom(C * length(tt), size = theta, mu = rep(lam * pic, length(tt))), C)
+    sec <- matrix(rbinom(length(tot), tot, p2), C)
+    nzr <- which(tot > 0)
+    rl_all[[length(rl_all) + 1]] <<- data.table(cat = cats[(nzr - 1) %% C + 1], k = k, r = r, t = tt[(nzr - 1) %/% C + 1], n = tot[nzr])
+    out <- vector("list", length(tt))
+    for (j in seq_along(tt)) {
+      cnt <- matrix(0, C, E)
+      for (c in which(tot[, j] > 0)) {
+        cnt[c, ] <- rmultinom(1, tot[c, j], P[c, ])[, 1] + if (sec[c, j] > 0) rmultinom(1, sec[c, j], P[c, ])[, 1] else 0
+      }
+      nz <- which(cnt > 0)
+      if (!length(nz)) next
+      out[[j]] <- data.table(cat = cats[(nz - 1) %% C + 1], ev = evs[(nz - 1) %/% C + 1], k = k, r = r, t = tt[j], n = cnt[nz], litig = FALSE)
+    }
+    rbindlist(out)
+  }
+  pre <- seq_len(Tpre); post <- (Tpre + 1):Tm
+  cnt <- rbind(mk("Direct", "pre", pre, 60, piD, PD), mk("Direct", "post", post, 30, piD, PD),
+               mk("Industry", "pre", pre, 8, piI, PI), mk("Industry", "post", post, 8 * M_reg, piI, PI))
+  shock <- function(tt, lam, k) data.table(cat = "c01", ev = "e01", k = k, r = ifelse(tt <= Tpre, "pre", "post"), t = tt,
+                                           n = rnbinom(length(tt), size = theta, mu = lam), litig = TRUE)
+  if (litig == "burst")     cnt <- rbind(cnt, shock(70:75, 2500, "Industry"))
+  if (litig == "notoriety") cnt <- rbind(cnt, shock(70:75, 250, "Direct"))
+  if (litig == "sustained") cnt <- rbind(cnt, shock(40:Tm, 250, "Industry"))
+  rl <- rbind(rbindlist(rl_all), cnt[litig == TRUE, .(cat, k, r, t, n)])   # shocked reports carry one event group
+  rl <- rl[, .(n = sum(n)), by = .(cat, k, r, t)]
+  cnt <- cnt[, .(n = sum(n)), by = .(cat, ev, k, r, t, litig)]
+  am <- list(pre = pre, post = post)
+  truth <- as.vector(RR > 1); isshock <- seq_len(C * E) == 1
+  auc <- function(s) { s <- as.vector(s); s[!is.finite(s)] <- -1e6; s <- s[!isshock]; y <- truth[!isshock]
+    rk <- rank(s); n1 <- sum(y); n0 <- sum(!y); (sum(rk[y]) - n1 * (n1 + 1) / 2) / (n1 * n0) }
+  one <- function(res, orc, lab) {
+    stat <- list(prr = log(pmax(res$cr$prr, 1e-9)), ror = res$cr$ror_low, ic = res$cr$ic025, mh = res$mh$low,
+                 sub = res$sg_low, rb = res$rb$low, oracle = orc$ror_low)
+    flag <- list(prr = res$cr$f_prr, ror = res$cr$f_ror, ic = res$cr$f_ic, mh = res$mh$f, sub = res$sg_f,
+                 rb = res$rb$f, oracle = orc$f_ror)
+    rbindlist(lapply(names(flag), function(m) {
+      f <- as.vector(flag[[m]]); f[is.na(f)] <- FALSE
+      data.table(table_type = lab, method = m, power = mean(f[truth]), fpr = mean(f[!truth & !isshock]),
+                 lit_flag = mean(f[isshock]), auc = auc(stat[[m]]))
+    }))
+  }
+  rl_nl <- rbindlist(rl_all)[, .(n = sum(n)), by = .(cat, k, r, t)]   # reports without the shock (oracle)
+  rbind(one(run_methods(cnt, cats, evs, am), crude_methods(mat_of(cnt[litig == FALSE], cats, evs)), "Mention level"),
+        one(run_methods(cnt, cats, evs, am, rl = rl), crude_methods(mat_of(cnt[litig == FALSE], cats, evs), rt = rowvec_of(rl_nl, cats)), "Report level"))
+}
+if (!file.exists("step11_rl_sim_raw.csv")) {
+  jobs <- copy(base_jobs)
+  fun <- function(j) { o <- sim_real2(j$M_reg, j$litig, j$seed); o[, `:=`(litig = j$litig, rep = j$rep)]; o }
+  cat("Overdispersed simulation, mention- vs report-level tables:", nrow(jobs), "databases\n")
+  fwrite(run_parallel(jobs, fun, extra = "sim_real2"), "step11_rl_sim_raw.csv", bom = TRUE)
+} else cat("step11 report-level simulation outputs found -> skipped\n")
+rls <- fread("step11_rl_sim_raw.csv")
+chk11 <- merge(rls[table_type == "Mention level", .(litig, method, rep, fpr_new = fpr)],
+               fread("step05_realsim_raw.csv")[, .(litig, method, rep, fpr_step05 = fpr)],
+               by = c("litig", "method", "rep"))                        # same database, same method
+cat("Mention-level results reproduce step05:", all(abs(chk11$fpr_new - chk11$fpr_step05) < 1e-9), "\n")   # must be TRUE
+tab11 <- rls[, .(fpr = round(mean(fpr), 4), fpr_mcse = round(sd(fpr) / sqrt(.N), 4),
+                 power = round(mean(power), 3), power_mcse = round(sd(power) / sqrt(.N), 4),
+                 auc = round(mean(auc), 3), shocked_pair_flag = round(mean(lit_flag), 3), n_datasets = .N),
+             by = .(scenario = litig, table_type, method)]
+tab11 <- tab11[order(match(scenario, names(litig_lab)), table_type, match(method, main_m))]
+tab11[, `:=`(scenario = litig_lab[scenario], method = meth_lab[method])]
+print(tab11)
+fwrite(tab11, "step11_tableS8_report_level.csv", bom = TRUE)
+
+# ---- 11.3 serious-event enrichment and 11.4 extreme dominance -------------------
+sim_v11 <- function(j) {
+  o <- if (j$design == "serious") sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, sev_shift = 5) else
+    sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, shock_mult = if (j$litig == "burst") 3 else 2.3)
+  o[, `:=`(design = j$design, litig = j$litig, rep = j$rep)]; o
+}
+if (!file.exists("step11_design_sim_raw.csv")) {
+  jobs <- rbind(copy(base_jobs)[, design := "serious"],
+                copy(base_jobs)[litig %in% c("burst", "sustained")][, design := "extreme"])   # 2,000 + 1,000 databases
+  cat("Serious-only selection and extreme dominance:", nrow(jobs), "databases\n")
+  fwrite(run_parallel(jobs, sim_v11, extra = "sim_v11"), "step11_design_sim_raw.csv", bom = TRUE)
+} else cat("step11 design simulation outputs found -> skipped\n")
+dsr <- fread("step11_design_sim_raw.csv")
+tab11b <- dsr[, .(fpr = round(mean(fpr), 4), fpr_mcse = round(sd(fpr) / sqrt(.N), 4),
+                  power = round(mean(power), 3), power_mcse = round(sd(power) / sqrt(.N), 4),
+                  auc = round(mean(auc), 3), shocked_pair_flag = round(mean(lit_flag), 3),
+                  shock_share = round(mean(shock_share), 3), n_datasets = .N),
+              by = .(design, scenario = litig, method)]
+tab11b <- tab11b[order(design, match(scenario, names(litig_lab)), match(method, main_m))]
+tab11b[, `:=`(scenario = litig_lab[scenario], method = meth_lab[method],
+              design = fifelse(design == "serious", "Serious-only selection (mandatory Industry)", "Extreme dominance (about 85%)"))]
+print(tab11b)
+fwrite(tab11b, "step11_table_design_scenarios.csv", bom = TRUE)
+cat("\nstep11 finished.\n")
+
+# ======================================================================
+# STEP 12 : additional robustness analyses
+#   12.1 true signal in the shocked pair itself: the shocked pair (c01, e01)
+#        has a true relative reporting rate of 2, and the shock is added on top
+#        (4 shocks x 500; "Shocked pair flagged" = power for that pair)
+#   12.2 burst duration: litigation and notoriety bursts lasting 9, 12 or 18
+#        months at the same monthly intensity (2 shocks x 3 lengths x 500);
+#        6 months = main simulation
+# Regime multiplier 5, no composition shift, same seeds as the main Monte Carlo.
+# New arguments (shock_rr, shock_len) default to the earlier design; power now
+# excludes the shocked pair explicitly, which changes nothing when it is not a
+# true signal (checked by the step04 reproducibility check).
+# ======================================================================
+cat("\n--- step12 ---\n")
+sim_v12 <- function(j) {
+  o <- if (j$design == "same_pair") sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, shock_rr = 2) else
+    sim_ext(j$M_reg, j$litig, j$comp_shift, j$seed, shock_len = j$len)
+  o[, `:=`(design = j$design, len = j$len, litig = j$litig, rep = j$rep)]; o
+}
+if (!file.exists("step12_sim_raw.csv")) {
+  jobs <- rbind(copy(base_jobs)[, `:=`(design = "same_pair", len = 6L)],
+                rbindlist(lapply(c(9L, 12L, 18L), function(L)
+                  copy(base_jobs)[litig %in% c("burst", "notoriety")][, `:=`(design = "duration", len = L)])))   # 2,000 + 3,000
+  cat("True signal in the shocked pair and burst duration:", nrow(jobs), "databases\n")
+  fwrite(run_parallel(jobs, sim_v12, extra = "sim_v12"), "step12_sim_raw.csv", bom = TRUE)
+} else cat("step12 simulation outputs found -> skipped\n")
+s12 <- fread("step12_sim_raw.csv")
+s12 <- rbind(s12[, .(design, len, litig, method, rep, power, fpr, lit_flag, auc, shock_share)],
+             mc_raw[M_reg == 5 & comp_shift == FALSE & litig %in% c("burst", "notoriety") & method %in% main_m,
+                    .(design = "duration", len = 6L, litig, method, rep, power, fpr, lit_flag, auc, shock_share = NA_real_)])  # 6 months = main
+tab12 <- s12[, .(fpr = round(mean(fpr), 4), fpr_mcse = round(sd(fpr) / sqrt(.N), 4),
+                 power = round(mean(power), 3), power_mcse = round(sd(power) / sqrt(.N), 4),
+                 auc = round(mean(auc), 3), shocked_pair_flag = round(mean(lit_flag), 3),
+                 shocked_pair_mcse = round(sd(lit_flag) / sqrt(.N), 4),
+                 shock_share = round(mean(shock_share), 3), n_datasets = .N),
+             by = .(design, scenario = litig, burst_months = len, method)]
+tab12 <- tab12[order(match(design, c("same_pair", "duration")), match(scenario, names(litig_lab)), burst_months, match(method, main_m))]
+tab12[, `:=`(scenario = litig_lab[scenario], method = meth_lab[method],
+             design = fifelse(design == "same_pair", "True signal (RR 2) in the shocked pair", "Burst duration"))]
+print(tab12[method %in% c("ROR", "MH-ROR", "RB (proposed)", "Oracle ROR")])
+fwrite(tab12, "step12_table_same_pair_duration.csv", bom = TRUE)
+cat("\nstep12 finished.\n")
